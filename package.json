@@ -1,0 +1,25 @@
+{
+  "name": "telegram-pi-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "check": "node --check src/index.mjs && node --check src/manage.mjs && node --check src/tui.mjs && node --check src/manager-lib.mjs",
+    "bridge:start": "node src/manage.mjs start",
+    "bridge:stop": "node src/manage.mjs stop",
+    "bridge:restart": "node src/manage.mjs restart",
+    "bridge:status": "node src/manage.mjs status",
+    "bridge:logs": "node src/manage.mjs logs bridge",
+    "bridge:audit": "node src/manage.mjs logs audit",
+    "tui": "node src/tui.mjs"
+  },
+  "dependencies": {
+    "@mariozechner/pi-ai": "^0.56.3",
+    "@mariozechner/pi-coding-agent": "^0.56.3",
+    "blessed": "^0.1.81",
+    "dotenv": "^16.4.7",
+    "grammy": "^1.35.0",
+    "qrcode": "^1.5.4"
+  }
+}
