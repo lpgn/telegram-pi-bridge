@@ -1,34 +1,54 @@
 import blessed from "blessed";
 import crypto from "node:crypto";
 import os from "node:os";
+import QRCode from "qrcode";
 import {
   AUDIT_LOG,
   ENV_FILE,
   OUT_LOG,
+  PI_AUTH_FILE,
+  SHARE_DIR,
   SYSTEMD_LOCAL_FILE,
   SYSTEMD_TEMPLATE_FILE,
+  clearLogFile,
+  getEffectiveConfig,
   getEnvStatus,
   getStatus,
   readLogTail,
   restartBridge,
   startBridge,
   stopBridge,
+  testConfiguration,
   writeEnvConfig,
   writeSystemdService,
 } from "./manager-lib.mjs";
 
-const screen = blessed.screen({
-  smartCSR: true,
-  title: "Telegram Pi Bridge Manager",
-  fullUnicode: true,
-});
+const screen = blessed.screen({ smartCSR: true, title: "Telegram Pi Bridge Manager", fullUnicode: true });
+
+const MENU_ITEMS = [
+  "First-run config wizard",
+  "Edit settings",
+  "Regenerate unlock secret",
+  "Export TOTP QR",
+  "Generate local systemd service",
+  "Test configuration",
+  "Start bridge",
+  "Stop bridge",
+  "Restart bridge",
+  "Show bridge log",
+  "Show audit log",
+  "Clear bridge log",
+  "Clear audit log",
+  "Refresh",
+  "Quit",
+];
 
 const statusBox = blessed.box({
   parent: screen,
   top: 0,
   left: 0,
   width: "100%",
-  height: 8,
+  height: 9,
   label: " Status ",
   tags: true,
   border: "line",
@@ -38,38 +58,25 @@ const statusBox = blessed.box({
 
 const menu = blessed.list({
   parent: screen,
-  top: 8,
+  top: 9,
   left: 0,
-  width: 30,
-  height: "100%-12",
+  width: 32,
+  height: "100%-13",
   label: " Menu ",
   border: "line",
   keys: true,
   vi: true,
   mouse: true,
-  style: {
-    border: { fg: "cyan" },
-    item: { fg: "white" },
-    selected: { bg: "blue", fg: "white", bold: true },
-  },
-  items: [
-    "First-run config wizard",
-    "Start bridge",
-    "Stop bridge",
-    "Restart bridge",
-    "Show bridge log",
-    "Show audit log",
-    "Refresh",
-    "Quit",
-  ],
+  style: { border: { fg: "cyan" }, item: { fg: "white" }, selected: { bg: "blue", fg: "white", bold: true } },
+  items: MENU_ITEMS,
 });
 
 const outputBox = blessed.box({
   parent: screen,
-  top: 8,
-  left: 30,
-  width: "100%-30",
-  height: "100%-12",
+  top: 9,
+  left: 32,
+  width: "100%-32",
+  height: "100%-13",
   label: " Output ",
   tags: true,
   scrollable: true,
@@ -95,88 +102,64 @@ const helpBox = blessed.box({
   style: { border: { fg: "cyan" } },
   padding: { left: 1, right: 1 },
   content:
-    "{bold}Enter{/bold} run menu  {bold}w{/bold} wizard  {bold}s{/bold} start  {bold}x{/bold} stop  {bold}r{/bold} restart  {bold}b{/bold} bridge log  {bold}a{/bold} audit log  {bold}u{/bold} refresh  {bold}q{/bold} quit",
+    "{bold}Enter{/bold} run menu  {bold}w{/bold} wizard  {bold}e{/bold} edit  {bold}g{/bold} gen service  {bold}t{/bold} test  {bold}s{/bold} start  {bold}x{/bold} stop  {bold}r{/bold} restart  {bold}q{/bold} quit",
 });
 
 let currentLog = "bridge";
 let statusTimer;
 
 menu.focus();
-menu.on("select", async (_item, index) => {
-  await runAction(index);
-});
-
+menu.on("select", async (_item, index) => runAction(index));
 screen.key(["q", "C-c", "escape"], () => shutdown());
 screen.key(["w"], async () => runAction(0));
-screen.key(["s"], async () => runAction(1));
-screen.key(["x"], async () => runAction(2));
-screen.key(["r"], async () => runAction(3));
-screen.key(["b"], async () => runAction(4));
-screen.key(["a"], async () => runAction(5));
-screen.key(["u"], async () => runAction(6));
-screen.key(["pageup"], () => {
-  outputBox.scroll(-15);
-  screen.render();
-});
-screen.key(["pagedown"], () => {
-  outputBox.scroll(15);
-  screen.render();
-});
+screen.key(["e"], async () => runAction(1));
+screen.key(["g"], async () => runAction(4));
+screen.key(["t"], async () => runAction(5));
+screen.key(["s"], async () => runAction(6));
+screen.key(["x"], async () => runAction(7));
+screen.key(["r"], async () => runAction(8));
+screen.key(["b"], async () => runAction(9));
+screen.key(["a"], async () => runAction(10));
+screen.key(["u"], async () => runAction(13));
+screen.key(["pageup"], () => { outputBox.scroll(-15); screen.render(); });
+screen.key(["pagedown"], () => { outputBox.scroll(15); screen.render(); });
 
 await refreshAll();
 statusTimer = setInterval(refreshAll, 2500);
 
 const envStatus = await getEnvStatus();
 if (!envStatus.configured) {
-  setMessage("Config incomplete. Open the first-run wizard with 'w' or the menu.", true);
-  outputBox.setContent(
-    [
-      `Config file: ${ENV_FILE}`,
-      "",
-      "Detected issues:",
-      ...envStatus.issues.map((issue) => `- ${issue}`),
-      "",
-      "Tip: run the first-run config wizard from the menu.",
-    ].join("\n")
-  );
+  setMessage("Config incomplete. Open the first-run wizard with 'w'.", true);
+  outputBox.setContent([
+    `Config file: ${ENV_FILE}`,
+    "",
+    "Detected issues:",
+    ...envStatus.issues.map((issue) => `- ${issue}`),
+    "",
+    "Tip: run the first-run config wizard from the menu.",
+  ].join("\n"));
   screen.render();
 }
 
 async function runAction(index) {
   try {
     switch (index) {
-      case 0:
-        await runWizard();
-        currentLog = "bridge";
-        break;
-      case 1:
-        setMessage((await startBridge()).message);
-        currentLog = "bridge";
-        break;
-      case 2:
-        setMessage((await stopBridge()).message);
-        currentLog = "bridge";
-        break;
-      case 3:
-        setMessage((await restartBridge()).message);
-        currentLog = "bridge";
-        break;
-      case 4:
-        currentLog = "bridge";
-        setMessage(`Showing ${OUT_LOG}`);
-        break;
-      case 5:
-        currentLog = "audit";
-        setMessage(`Showing ${AUDIT_LOG}`);
-        break;
-      case 6:
-        setMessage("Refreshed");
-        break;
-      case 7:
-        shutdown();
-        return;
-      default:
-        break;
+      case 0: await runWizard(); break;
+      case 1: await runSettingsEditor(); break;
+      case 2: await regenerateSecret(); break;
+      case 3: await exportTotpQr(); break;
+      case 4: await generateLocalService(); break;
+      case 5: await runConfigurationTest(); break;
+      case 6: setMessage((await startBridge()).message); currentLog = "bridge"; break;
+      case 7: setMessage((await stopBridge()).message); currentLog = "bridge"; break;
+      case 8: setMessage((await restartBridge()).message); currentLog = "bridge"; break;
+      case 9: currentLog = "bridge"; setMessage(`Showing ${OUT_LOG}`); break;
+      case 10: currentLog = "audit"; setMessage(`Showing ${AUDIT_LOG}`); break;
+      case 11: setMessage(await clearLogFile(OUT_LOG)); currentLog = "bridge"; break;
+      case 12: setMessage(await clearLogFile(AUDIT_LOG)); currentLog = "audit"; break;
+      case 13: setMessage("Refreshed"); break;
+      case 14: shutdown(); return;
+      default: break;
     }
     await refreshAll();
   } catch (error) {
@@ -201,9 +184,10 @@ function renderStatus(status) {
     `{bold}PID:{/bold} ${status.pid ?? "-"}`,
     `{bold}Config:{/bold} ${envLine}`,
     `{bold}.env:{/bold} ${ENV_FILE}`,
+    `{bold}Local service:{/bold} ${SYSTEMD_LOCAL_FILE}`,
+    `{bold}Service template:{/bold} ${SYSTEMD_TEMPLATE_FILE}`,
     `{bold}Bridge log:{/bold} ${status.outLog.path} (${formatBytes(status.outLog.size)})`,
     `{bold}Audit log:{/bold} ${status.auditLog.path} (${formatBytes(status.auditLog.size)})`,
-    `{bold}View:{/bold} ${currentLog === "bridge" ? "bridge.out" : "audit.log"}`,
   ];
   statusBox.setContent(lines.join("\n"));
 }
@@ -219,134 +203,62 @@ async function renderLog() {
 function setMessage(message, isError = false) {
   helpBox.setContent(
     `${isError ? "{red-fg}" : "{green-fg}"}${escapeTags(message)}${isError ? "{/red-fg}" : "{/green-fg}"}\n` +
-      "{bold}Enter{/bold} run menu  {bold}w{/bold} wizard  {bold}s{/bold} start  {bold}x{/bold} stop  {bold}r{/bold} restart  {bold}b{/bold} bridge log  {bold}a{/bold} audit log  {bold}u{/bold} refresh  {bold}q{/bold} quit"
+      "{bold}Enter{/bold} run menu  {bold}w{/bold} wizard  {bold}e{/bold} edit  {bold}g{/bold} gen service  {bold}t{/bold} test  {bold}s{/bold} start  {bold}x{/bold} stop  {bold}r{/bold} restart  {bold}q{/bold} quit"
   );
 }
 
 async function runWizard() {
-  const status = await getEnvStatus();
-  const current = status.values || {};
+  const current = await getEffectiveConfig();
+  const botToken = await askText("Telegram bot token", current.TELEGRAM_BOT_TOKEN, { secret: true });
+  if (botToken == null) return cancel();
+  const ownerId = await askText("Owner Telegram user ID", current.OWNER_TELEGRAM_USER_ID);
+  if (ownerId == null) return cancel();
+  const ownerChatId = await askText("Owner chat ID (optional)", current.OWNER_CHAT_ID);
+  if (ownerChatId == null) return cancel();
+  const privateOnly = await askChoice("Private chats only?", ["true", "false"], current.ALLOW_PRIVATE_CHATS_ONLY);
+  if (privateOnly == null) return cancel();
+  const unlockMethod = await askChoice("Unlock method", ["totp", "secret"], current.UNLOCK_METHOD);
+  if (unlockMethod == null) return cancel();
 
-  setMessage("Running first-run configuration wizard...");
-  screen.render();
-
-  const botToken = await askText(
-    "Telegram bot token",
-    current.TELEGRAM_BOT_TOKEN && current.TELEGRAM_BOT_TOKEN !== "123456789:replace_me"
-      ? current.TELEGRAM_BOT_TOKEN
-      : "",
-    { secret: true }
-  );
-  if (botToken == null) return setMessage("Wizard cancelled", true);
-
-  const ownerId = await askText(
-    "Owner Telegram user ID",
-    current.OWNER_TELEGRAM_USER_ID && current.OWNER_TELEGRAM_USER_ID !== "123456789"
-      ? current.OWNER_TELEGRAM_USER_ID
-      : ""
-  );
-  if (ownerId == null) return setMessage("Wizard cancelled", true);
-
-  const ownerChatId = await askText(
-    "Owner chat ID (optional, leave blank to disable)",
-    current.OWNER_CHAT_ID || ""
-  );
-  if (ownerChatId == null) return setMessage("Wizard cancelled", true);
-
-  const privateOnly = await askChoice("Private chats only?", ["true", "false"], current.ALLOW_PRIVATE_CHATS_ONLY || "true");
-  if (privateOnly == null) return setMessage("Wizard cancelled", true);
-
-  const unlockMethod = await askChoice(
-    "Unlock method",
-    ["totp", "secret"],
-    current.UNLOCK_METHOD || "totp"
-  );
-  if (unlockMethod == null) return setMessage("Wizard cancelled", true);
-
-  let totpSecret = current.UNLOCK_TOTP_SECRET || "";
-  let sharedSecret = current.UNLOCK_SHARED_SECRET || "";
-
+  let totpSecret = current.UNLOCK_TOTP_SECRET;
+  let sharedSecret = current.UNLOCK_SHARED_SECRET;
   if (unlockMethod === "totp") {
-    const generated = current.UNLOCK_TOTP_SECRET && current.UNLOCK_TOTP_SECRET !== "JBSWY3DPEHPK3PXP"
-      ? current.UNLOCK_TOTP_SECRET
-      : generateTotpSecret();
-    totpSecret = await askText("TOTP secret (base32)", generated);
-    if (totpSecret == null) return setMessage("Wizard cancelled", true);
+    totpSecret = await askText("TOTP secret (base32)", totpSecret || generateTotpSecret());
+    if (totpSecret == null) return cancel();
   } else {
-    const generated = current.UNLOCK_SHARED_SECRET && !current.UNLOCK_SHARED_SECRET.startsWith("replace_")
-      ? current.UNLOCK_SHARED_SECRET
-      : generateSharedSecret();
-    sharedSecret = await askText("Shared unlock secret", generated, { secret: true });
-    if (sharedSecret == null) return setMessage("Wizard cancelled", true);
+    sharedSecret = await askText("Shared unlock secret", sharedSecret || generateSharedSecret(), { secret: true });
+    if (sharedSecret == null) return cancel();
   }
 
-  const ttl = await askText("Unlock TTL in minutes", current.UNLOCK_TTL_MINUTES || "15");
-  if (ttl == null) return setMessage("Wizard cancelled", true);
-
-  const alerts = await askChoice(
-    "Alert owner on denied access?",
-    ["true", "false"],
-    current.ALERT_OWNER_ON_DENIED || "true"
-  );
-  if (alerts == null) return setMessage("Wizard cancelled", true);
-
-  const workspace = await askText("pi workspace directory", current.PI_WORKSPACE_DIR || process.cwd());
-  if (workspace == null) return setMessage("Wizard cancelled", true);
-
+  const ttl = await askText("Unlock TTL in minutes", current.UNLOCK_TTL_MINUTES);
+  if (ttl == null) return cancel();
+  const alerts = await askChoice("Alert owner on denied access?", ["true", "false"], current.ALERT_OWNER_ON_DENIED);
+  if (alerts == null) return cancel();
+  const workspace = await askText("pi workspace directory", current.PI_WORKSPACE_DIR);
+  if (workspace == null) return cancel();
   const agentDir = await askText("pi agent directory", current.PI_AGENT_DIR || "~/.pi/agent");
-  if (agentDir == null) return setMessage("Wizard cancelled", true);
+  if (agentDir == null) return cancel();
+  const maxTextLength = await askText("Max Telegram text length", current.MAX_TEXT_LENGTH);
+  if (maxTextLength == null) return cancel();
+  const thinking = await askChoice("pi thinking level", ["off", "low", "medium", "high"], current.PI_THINKING_LEVEL);
+  if (thinking == null) return cancel();
+  const pinModel = await askChoice("Pin a specific pi model?", ["no", "yes"], current.PI_MODEL_PROVIDER && current.PI_MODEL_NAME ? "yes" : "no");
+  if (pinModel == null) return cancel();
 
-  const maxTextLength = await askText("Max Telegram text length", current.MAX_TEXT_LENGTH || "12000");
-  if (maxTextLength == null) return setMessage("Wizard cancelled", true);
-
-  const thinking = await askChoice(
-    "pi thinking level",
-    ["off", "low", "medium", "high"],
-    current.PI_THINKING_LEVEL || "medium"
-  );
-  if (thinking == null) return setMessage("Wizard cancelled", true);
-
-  const pinModel = await askChoice(
-    "Pin a specific pi model?",
-    ["no", "yes"],
-    current.PI_MODEL_PROVIDER && current.PI_MODEL_NAME ? "yes" : "no"
-  );
-  if (pinModel == null) return setMessage("Wizard cancelled", true);
-
-  let modelProvider = "";
-  let modelName = "";
+  let modelProvider = current.PI_MODEL_PROVIDER;
+  let modelName = current.PI_MODEL_NAME;
   if (pinModel === "yes") {
-    modelProvider = await askText("pi model provider", current.PI_MODEL_PROVIDER || "anthropic");
-    if (modelProvider == null) return setMessage("Wizard cancelled", true);
-    modelName = await askText("pi model name", current.PI_MODEL_NAME || "claude-sonnet-4-20250514");
-    if (modelName == null) return setMessage("Wizard cancelled", true);
+    modelProvider = await askText("pi model provider", modelProvider || "anthropic");
+    if (modelProvider == null) return cancel();
+    modelName = await askText("pi model name", modelName || "claude-sonnet-4-20250514");
+    if (modelName == null) return cancel();
+  } else {
+    modelProvider = "";
+    modelName = "";
   }
 
-  const summary = [
-    `Bot token: ${maskValue(botToken)}`,
-    `Owner user ID: ${ownerId}`,
-    `Owner chat ID: ${ownerChatId || "(disabled)"}`,
-    `Private only: ${privateOnly}`,
-    `Unlock method: ${unlockMethod}`,
-    `Unlock secret: ${unlockMethod === "totp" ? maskValue(totpSecret) : maskValue(sharedSecret)}`,
-    `TTL: ${ttl} minutes`,
-    `Alerts: ${alerts}`,
-    `Workspace: ${workspace}`,
-    `pi agent dir: ${agentDir}`,
-    `Max text length: ${maxTextLength}`,
-    `Thinking: ${thinking}`,
-    `Fixed model: ${pinModel === "yes" ? `${modelProvider}/${modelName}` : "(none)"}`,
-    "",
-    `Write this to ${ENV_FILE}?`,
-  ].join("\n");
-
-  const confirmed = await askYesNo(summary, true);
-  if (!confirmed) {
-    setMessage("Wizard cancelled", true);
-    return;
-  }
-
-  await writeEnvConfig({
+  const config = {
+    ...current,
     TELEGRAM_BOT_TOKEN: botToken,
     OWNER_TELEGRAM_USER_ID: ownerId,
     OWNER_CHAT_ID: ownerChatId,
@@ -360,52 +272,180 @@ async function runWizard() {
     MAX_TEXT_LENGTH: normalizePositiveInt(maxTextLength, 12000),
     PI_WORKSPACE_DIR: workspace,
     PI_AGENT_DIR: agentDir,
-    PI_MODEL_PROVIDER: pinModel === "yes" ? modelProvider : "",
-    PI_MODEL_NAME: pinModel === "yes" ? modelName : "",
+    PI_MODEL_PROVIDER: modelProvider,
+    PI_MODEL_NAME: modelName,
     PI_THINKING_LEVEL: thinking,
-  });
+  };
 
-  let serviceNote = "- No systemd example generated";
-  const createService = await askChoice(
-    "Also generate a local systemd service example?",
-    ["yes", "no"],
-    "yes"
-  );
-  if (createService == null) return setMessage("Wizard cancelled", true);
+  const confirmed = await askYesNo([
+    `Bot token: ${maskValue(config.TELEGRAM_BOT_TOKEN)}`,
+    `Owner user ID: ${config.OWNER_TELEGRAM_USER_ID}`,
+    `Owner chat ID: ${config.OWNER_CHAT_ID || "(disabled)"}`,
+    `Private only: ${config.ALLOW_PRIVATE_CHATS_ONLY}`,
+    `Unlock method: ${config.UNLOCK_METHOD}`,
+    `Unlock secret: ${maskValue(config.UNLOCK_METHOD === "totp" ? config.UNLOCK_TOTP_SECRET : config.UNLOCK_SHARED_SECRET)}`,
+    `TTL: ${config.UNLOCK_TTL_MINUTES} minutes`,
+    `Workspace: ${config.PI_WORKSPACE_DIR}`,
+    `Agent dir: ${config.PI_AGENT_DIR}`,
+    `Thinking: ${config.PI_THINKING_LEVEL}`,
+    `Fixed model: ${config.PI_MODEL_PROVIDER && config.PI_MODEL_NAME ? `${config.PI_MODEL_PROVIDER}/${config.PI_MODEL_NAME}` : "(none)"}`,
+    "",
+    `Write this to ${ENV_FILE}?`,
+  ].join("\n"), true);
+  if (!confirmed) return cancel();
 
-  if (createService === "yes") {
-    const serviceUser = await askText("systemd User=", os.userInfo().username);
-    if (serviceUser == null) return setMessage("Wizard cancelled", true);
-    const installPath = await askText("systemd WorkingDirectory", process.cwd());
-    if (installPath == null) return setMessage("Wizard cancelled", true);
-    const service = await writeSystemdService({ installPath, user: serviceUser });
-    serviceNote = `- Wrote local systemd service to ${service.path}`;
-  }
-
+  await writeEnvConfig(config);
   setMessage(`Saved configuration to ${ENV_FILE}`);
-  currentLog = "bridge";
-  outputBox.setContent(
-    [
-      `Saved config to ${ENV_FILE}`,
-      serviceNote,
-      createService === "yes"
-        ? `- If wanted, copy ${SYSTEMD_LOCAL_FILE} to /etc/systemd/system/telegram-pi-bridge.service`
-        : "",
-      `- Public example template lives at ${SYSTEMD_TEMPLATE_FILE}`,
-      "",
-      "Next steps:",
-      "- Start the bridge from this TUI",
-      "- Open a private chat with your bot",
-      "- Use /unlock <code> to unlock it",
-      unlockMethod === "totp"
-        ? `- Add the TOTP secret to your authenticator app: ${totpSecret}`
-        : "- Keep your shared unlock secret somewhere safe",
-    ].filter(Boolean).join("\n")
-  );
-  screen.render();
+  outputBox.setContent([
+    `Saved config to ${ENV_FILE}`,
+    "",
+    "Suggested next actions:",
+    "- Generate local systemd service",
+    "- Export TOTP QR (if using totp)",
+    "- Start bridge",
+  ].join("\n"));
 }
 
-async function askText(label, initial = "", options = {}) {
+async function runSettingsEditor() {
+  let config = await getEffectiveConfig();
+  while (true) {
+    const choice = await askChoice("Edit settings", [
+      "Unlock TTL",
+      "Unlock method",
+      "Private chats only",
+      "Alert owner on denied",
+      "Owner Telegram user ID",
+      "Owner chat ID",
+      "Max text length",
+      "pi workspace directory",
+      "pi agent directory",
+      "Thinking level",
+      "Fixed model",
+      "Audit log path",
+      "Back",
+    ], "Unlock TTL");
+    if (!choice || choice === "Back") break;
+
+    if (choice === "Unlock TTL") {
+      const value = await askText("Unlock TTL in minutes", String(config.UNLOCK_TTL_MINUTES));
+      if (value != null) config.UNLOCK_TTL_MINUTES = normalizePositiveInt(value, 15);
+    } else if (choice === "Unlock method") {
+      const value = await askChoice("Unlock method", ["totp", "secret"], config.UNLOCK_METHOD);
+      if (value) config.UNLOCK_METHOD = value;
+    } else if (choice === "Private chats only") {
+      const value = await askChoice("Private chats only", ["true", "false"], config.ALLOW_PRIVATE_CHATS_ONLY);
+      if (value) config.ALLOW_PRIVATE_CHATS_ONLY = value;
+    } else if (choice === "Alert owner on denied") {
+      const value = await askChoice("Alert owner on denied", ["true", "false"], config.ALERT_OWNER_ON_DENIED);
+      if (value) config.ALERT_OWNER_ON_DENIED = value;
+    } else if (choice === "Owner Telegram user ID") {
+      const value = await askText("Owner Telegram user ID", config.OWNER_TELEGRAM_USER_ID);
+      if (value != null) config.OWNER_TELEGRAM_USER_ID = value;
+    } else if (choice === "Owner chat ID") {
+      const value = await askText("Owner chat ID (optional)", config.OWNER_CHAT_ID);
+      if (value != null) config.OWNER_CHAT_ID = value;
+    } else if (choice === "Max text length") {
+      const value = await askText("Max Telegram text length", String(config.MAX_TEXT_LENGTH));
+      if (value != null) config.MAX_TEXT_LENGTH = normalizePositiveInt(value, 12000);
+    } else if (choice === "pi workspace directory") {
+      const value = await askText("pi workspace directory", config.PI_WORKSPACE_DIR);
+      if (value != null) config.PI_WORKSPACE_DIR = value;
+    } else if (choice === "pi agent directory") {
+      const value = await askText("pi agent directory", config.PI_AGENT_DIR);
+      if (value != null) config.PI_AGENT_DIR = value;
+    } else if (choice === "Thinking level") {
+      const value = await askChoice("Thinking level", ["off", "low", "medium", "high"], config.PI_THINKING_LEVEL);
+      if (value) config.PI_THINKING_LEVEL = value;
+    } else if (choice === "Fixed model") {
+      const enabled = await askChoice("Fixed model", ["disabled", "enabled"], config.PI_MODEL_PROVIDER && config.PI_MODEL_NAME ? "enabled" : "disabled");
+      if (enabled === "disabled") {
+        config.PI_MODEL_PROVIDER = "";
+        config.PI_MODEL_NAME = "";
+      } else if (enabled === "enabled") {
+        const provider = await askText("pi model provider", config.PI_MODEL_PROVIDER || "anthropic");
+        if (provider == null) continue;
+        const model = await askText("pi model name", config.PI_MODEL_NAME || "claude-sonnet-4-20250514");
+        if (model == null) continue;
+        config.PI_MODEL_PROVIDER = provider;
+        config.PI_MODEL_NAME = model;
+      }
+    } else if (choice === "Audit log path") {
+      const value = await askText("Audit log path", config.AUDIT_LOG_FILE || AUDIT_LOG);
+      if (value != null) config.AUDIT_LOG_FILE = value;
+    }
+
+    if (config.UNLOCK_METHOD === "totp" && !config.UNLOCK_TOTP_SECRET) config.UNLOCK_TOTP_SECRET = generateTotpSecret();
+    if (config.UNLOCK_METHOD === "secret" && !config.UNLOCK_SHARED_SECRET) config.UNLOCK_SHARED_SECRET = generateSharedSecret();
+
+    await writeEnvConfig(config);
+    setMessage(`Saved setting: ${choice}`);
+  }
+}
+
+async function regenerateSecret() {
+  const config = await getEffectiveConfig();
+  const which = await askChoice("Regenerate unlock secret", ["totp secret", "shared secret", "cancel"], "totp secret");
+  if (!which || which === "cancel") return cancel();
+  if (which === "totp secret") {
+    config.UNLOCK_METHOD = "totp";
+    config.UNLOCK_TOTP_SECRET = generateTotpSecret();
+    await writeEnvConfig(config);
+    setMessage("Generated new TOTP secret and saved .env");
+    outputBox.setContent(`New TOTP secret:\n\n${config.UNLOCK_TOTP_SECRET}\n\nUse Export TOTP QR to create a QR image.`);
+  } else {
+    config.UNLOCK_METHOD = "secret";
+    config.UNLOCK_SHARED_SECRET = generateSharedSecret();
+    await writeEnvConfig(config);
+    setMessage("Generated new shared secret and saved .env");
+    outputBox.setContent(`New shared secret:\n\n${config.UNLOCK_SHARED_SECRET}`);
+  }
+}
+
+async function exportTotpQr() {
+  const config = await getEffectiveConfig();
+  if (config.UNLOCK_METHOD !== "totp" || !config.UNLOCK_TOTP_SECRET) {
+    setMessage("Current config is not using TOTP", true);
+    return;
+  }
+  await ensureShareDir();
+  const issuer = "Telegram Pi Bridge";
+  const account = "telegram-pi-bridge";
+  const uri = `otpauth://totp/${encodeURIComponent(issuer)}:${encodeURIComponent(account)}?secret=${config.UNLOCK_TOTP_SECRET}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
+  const pngPath = `${SHARE_DIR}/totp-qr.png`;
+  const txtPath = `${SHARE_DIR}/totp-uri.txt`;
+  await QRCode.toFile(pngPath, uri, { type: "png", width: 512, margin: 2 });
+  await import("node:fs/promises").then((fs) => fs.writeFile(txtPath, `${uri}\n`, "utf8"));
+  setMessage(`Exported TOTP QR to ${pngPath}`);
+  outputBox.setContent([`QR image: ${pngPath}`, `OTP URI: ${txtPath}`, "", uri].join("\n"));
+}
+
+async function generateLocalService() {
+  const config = await getEffectiveConfig();
+  const serviceUser = await askText("systemd User=", os.userInfo().username);
+  if (serviceUser == null) return cancel();
+  const installPath = await askText("systemd WorkingDirectory", config.PI_WORKSPACE_DIR || process.cwd());
+  if (installPath == null) return cancel();
+  const service = await writeSystemdService({ installPath, user: serviceUser });
+  setMessage(`Generated local service: ${service.path}`);
+  outputBox.setContent([
+    `Local service file: ${service.path}`,
+    `Public example template: ${SYSTEMD_TEMPLATE_FILE}`,
+    "",
+    `To install system-wide:`,
+    `sudo cp ${service.path} /etc/systemd/system/telegram-pi-bridge.service`,
+    `sudo systemctl daemon-reload`,
+    `sudo systemctl enable --now telegram-pi-bridge`,
+  ].join("\n"));
+}
+
+async function runConfigurationTest() {
+  const checks = await testConfiguration();
+  const lines = checks.map((check) => `${check.ok ? "[OK]" : "[WARN]"} ${check.name} — ${check.details}`);
+  setMessage(checks.every((c) => c.ok) ? "Configuration test passed" : "Configuration test found issues", !checks.every((c) => c.ok));
+  outputBox.setContent(lines.join("\n"));
+}
+
+async function askText(label, initial = "", _options = {}) {
   return new Promise((resolve) => {
     const prompt = blessed.prompt({
       parent: screen,
@@ -418,15 +458,9 @@ async function askText(label, initial = "", options = {}) {
       tags: true,
       keys: true,
       vi: true,
-      style: {
-        border: { fg: "green" },
-        fg: "white",
-        bg: "black",
-      },
+      style: { border: { fg: "green" }, fg: "white", bg: "black" },
     });
-
-    const askLabel = options.secret ? `${label} (input hidden in summary only)` : label;
-    prompt.input(askLabel, initial, (_err, value) => {
+    prompt.input(label, String(initial ?? ""), (_err, value) => {
       prompt.destroy();
       screen.render();
       if (typeof value !== "string") return resolve(null);
@@ -442,31 +476,21 @@ async function askChoice(label, options, current) {
       parent: screen,
       border: "line",
       label: ` ${label} `,
-      width: 42,
-      height: Math.min(options.length + 4, 10),
+      width: 48,
+      height: Math.min(options.length + 4, 16),
       top: "center",
       left: "center",
       keys: true,
       vi: true,
       mouse: true,
       items: options,
-      style: {
-        border: { fg: "green" },
-        selected: { bg: "blue", bold: true },
-      },
+      style: { border: { fg: "green" }, selected: { bg: "blue", bold: true } },
     });
-
     const initialIndex = Math.max(0, options.indexOf(current));
     list.select(initialIndex);
     list.focus();
     screen.render();
-
-    const finish = (value) => {
-      list.destroy();
-      screen.render();
-      resolve(value);
-    };
-
+    const finish = (value) => { list.destroy(); screen.render(); resolve(value); };
     list.key(["enter"], () => finish(list.getItem(list.selected).content));
     list.key(["escape", "q"], () => finish(null));
   });
@@ -485,11 +509,8 @@ async function askYesNo(message, defaultYes = true) {
       tags: true,
       keys: true,
       vi: true,
-      style: {
-        border: { fg: "green" },
-      },
+      style: { border: { fg: "green" } },
     });
-
     question.ask(`${escapeTags(message)}\n\n${defaultYes ? "[Y/n]" : "[y/N]"}`, (value) => {
       question.destroy();
       screen.render();
@@ -512,10 +533,7 @@ function toBase32(buffer) {
   let bits = "";
   for (const byte of buffer) bits += byte.toString(2).padStart(8, "0");
   let output = "";
-  for (let i = 0; i < bits.length; i += 5) {
-    const chunk = bits.slice(i, i + 5).padEnd(5, "0");
-    output += alphabet[Number.parseInt(chunk, 2)];
-  }
+  for (let i = 0; i < bits.length; i += 5) output += alphabet[Number.parseInt(bits.slice(i, i + 5).padEnd(5, "0"), 2)];
   return output;
 }
 
@@ -527,7 +545,7 @@ function maskValue(value) {
 
 function normalizePositiveInt(value, fallback) {
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+  return Number.isFinite(parsed) && parsed > 0 ? String(Math.floor(parsed)) : String(fallback);
 }
 
 function formatBytes(bytes) {
@@ -538,6 +556,14 @@ function formatBytes(bytes) {
 
 function escapeTags(value) {
   return String(value).replace(/[{}]/g, "");
+}
+
+function cancel() {
+  setMessage("Operation cancelled", true);
+}
+
+async function ensureShareDir() {
+  await import("node:fs/promises").then((fs) => fs.mkdir(SHARE_DIR, { recursive: true }));
 }
 
 function shutdown() {

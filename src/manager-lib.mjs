@@ -1,4 +1,5 @@
-import { mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
@@ -7,6 +8,7 @@ import { fileURLToPath } from "node:url";
 export const BASE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const RUN_DIR = path.join(BASE_DIR, "run");
 export const LOG_DIR = path.join(BASE_DIR, "logs");
+export const SHARE_DIR = path.join(BASE_DIR, "share");
 export const PID_FILE = path.join(RUN_DIR, "bridge.pid");
 export const OUT_LOG = path.join(BASE_DIR, "bridge.out");
 export const AUDIT_LOG = path.join(LOG_DIR, "audit.log");
@@ -16,11 +18,13 @@ export const ENV_EXAMPLE_FILE = path.join(BASE_DIR, ".env.example");
 export const SYSTEMD_DIR = path.join(BASE_DIR, "systemd");
 export const SYSTEMD_LOCAL_FILE = path.join(SYSTEMD_DIR, "telegram-pi-bridge.service");
 export const SYSTEMD_TEMPLATE_FILE = path.join(SYSTEMD_DIR, "telegram-pi-bridge.service.example");
+export const PI_AUTH_FILE = path.join(os.homedir(), ".pi", "agent", "auth.json");
 const execFileAsync = promisify(execFile);
 
 export async function ensureRuntimeDirs() {
   await mkdir(RUN_DIR, { recursive: true });
   await mkdir(LOG_DIR, { recursive: true });
+  await mkdir(SHARE_DIR, { recursive: true });
 }
 
 export async function getPid() {
@@ -162,10 +166,19 @@ export async function readLogTail(logPath, maxBytes = 24000) {
   }
 }
 
+export async function clearLogFile(logPath) {
+  try {
+    await truncate(logPath, 0);
+    return `Cleared ${logPath}`;
+  } catch (error) {
+    return `Could not clear ${logPath}: ${error.message || String(error)}`;
+  }
+}
+
 export async function getEnvStatus() {
   const fileStat = await safeStat(ENV_FILE);
   if (!fileStat) {
-    return { exists: false, configured: false, issues: [".env is missing"] };
+    return { exists: false, configured: false, issues: [".env is missing"], values: {} };
   }
 
   const env = await readEnvFile();
@@ -202,6 +215,29 @@ export async function getEnvStatus() {
 export async function readEnvFile() {
   const raw = await readFile(ENV_FILE, "utf8");
   return parseEnv(raw);
+}
+
+export async function getEffectiveConfig() {
+  const envStatus = await getEnvStatus();
+  const env = envStatus.values || {};
+  return {
+    TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN || "",
+    OWNER_TELEGRAM_USER_ID: env.OWNER_TELEGRAM_USER_ID || "",
+    OWNER_CHAT_ID: env.OWNER_CHAT_ID || "",
+    ALLOW_PRIVATE_CHATS_ONLY: env.ALLOW_PRIVATE_CHATS_ONLY || "true",
+    UNLOCK_METHOD: env.UNLOCK_METHOD || "totp",
+    UNLOCK_TOTP_SECRET: env.UNLOCK_TOTP_SECRET || "",
+    UNLOCK_SHARED_SECRET: env.UNLOCK_SHARED_SECRET || "",
+    UNLOCK_TTL_MINUTES: env.UNLOCK_TTL_MINUTES || "15",
+    ALERT_OWNER_ON_DENIED: env.ALERT_OWNER_ON_DENIED || "true",
+    AUDIT_LOG_FILE: env.AUDIT_LOG_FILE || AUDIT_LOG,
+    MAX_TEXT_LENGTH: env.MAX_TEXT_LENGTH || "12000",
+    PI_WORKSPACE_DIR: env.PI_WORKSPACE_DIR || process.cwd(),
+    PI_AGENT_DIR: env.PI_AGENT_DIR || "~/.pi/agent",
+    PI_MODEL_PROVIDER: env.PI_MODEL_PROVIDER || "",
+    PI_MODEL_NAME: env.PI_MODEL_NAME || "",
+    PI_THINKING_LEVEL: env.PI_THINKING_LEVEL || "medium",
+  };
 }
 
 export async function writeEnvConfig(config) {
@@ -252,6 +288,20 @@ export function renderSystemdService({ workingDirectory, user }) {
   return `[Unit]\nDescription=Telegram Pi Bridge\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=${safeUser}\nWorkingDirectory=${safeDir}\nEnvironmentFile=${safeDir}/.env\nExecStart=/usr/bin/npm start\nRestart=always\nRestartSec=5\nNoNewPrivileges=true\nPrivateTmp=true\nProtectControlGroups=true\nProtectKernelTunables=true\nProtectKernelModules=true\nLockPersonality=true\nRestrictSUIDSGID=true\nUMask=0077\n\n[Install]\nWantedBy=multi-user.target\n`;
 }
 
+export async function testConfiguration() {
+  const envStatus = await getEnvStatus();
+  const checks = [];
+  checks.push({ name: ".env file", ok: envStatus.exists, details: ENV_FILE });
+  checks.push({ name: "Config completeness", ok: envStatus.configured, details: envStatus.issues.join("; ") || "ok" });
+  const piAuth = await safeStat(PI_AUTH_FILE);
+  checks.push({ name: "pi auth", ok: Boolean(piAuth), details: PI_AUTH_FILE });
+  const localService = await safeStat(SYSTEMD_LOCAL_FILE);
+  checks.push({ name: "Local systemd service", ok: Boolean(localService), details: SYSTEMD_LOCAL_FILE });
+  const templateService = await safeStat(SYSTEMD_TEMPLATE_FILE);
+  checks.push({ name: "Service example template", ok: Boolean(templateService), details: SYSTEMD_TEMPLATE_FILE });
+  return checks;
+}
+
 function parseEnv(raw) {
   const result = {};
   for (const line of String(raw).split(/\r?\n/)) {
@@ -289,17 +339,14 @@ async function findBridgePid() {
       if (!Number.isFinite(pid) || pid === process.pid || !isPidRunning(pid)) continue;
 
       if (args.includes(ENTRYPOINT) || args.includes("node src/index.mjs")) {
-        if (!args.includes("sh -c node src/index.mjs")) {
-          return pid;
-        }
+        if (!args.includes("sh -c node src/index.mjs")) return pid;
         fallbackPid = fallbackPid ?? pid;
       }
     }
     return fallbackPid;
   } catch {
-    // ignore process scan failures
+    return null;
   }
-  return null;
 }
 
 async function waitForExit(pid, timeoutMs) {
