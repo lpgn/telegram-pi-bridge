@@ -310,8 +310,11 @@ async function runSettingsEditor() {
   let config = await getEffectiveConfig();
   while (true) {
     const choice = await askChoice("Edit settings", [
+      "Telegram bot token",
       "Unlock TTL",
       "Unlock method",
+      "TOTP secret",
+      "Shared unlock secret",
       "Private chats only",
       "Alert owner on denied",
       "Owner Telegram user ID",
@@ -323,15 +326,30 @@ async function runSettingsEditor() {
       "Fixed model",
       "Audit log path",
       "Back",
-    ], "Unlock TTL");
+    ], "Telegram bot token");
     if (!choice || choice === "Back") break;
 
-    if (choice === "Unlock TTL") {
+    if (choice === "Telegram bot token") {
+      const value = await askText("Telegram bot token", config.TELEGRAM_BOT_TOKEN, { secret: true });
+      if (value != null) config.TELEGRAM_BOT_TOKEN = value;
+    } else if (choice === "Unlock TTL") {
       const value = await askText("Unlock TTL in minutes", String(config.UNLOCK_TTL_MINUTES));
       if (value != null) config.UNLOCK_TTL_MINUTES = normalizePositiveInt(value, 15);
     } else if (choice === "Unlock method") {
       const value = await askChoice("Unlock method", ["totp", "secret"], config.UNLOCK_METHOD);
       if (value) config.UNLOCK_METHOD = value;
+    } else if (choice === "TOTP secret") {
+      const value = await askText("TOTP secret (base32)", config.UNLOCK_TOTP_SECRET || generateTotpSecret(), { secret: true });
+      if (value != null) {
+        config.UNLOCK_METHOD = "totp";
+        config.UNLOCK_TOTP_SECRET = value;
+      }
+    } else if (choice === "Shared unlock secret") {
+      const value = await askText("Shared unlock secret", config.UNLOCK_SHARED_SECRET || generateSharedSecret(), { secret: true });
+      if (value != null) {
+        config.UNLOCK_METHOD = "secret";
+        config.UNLOCK_SHARED_SECRET = value;
+      }
     } else if (choice === "Private chats only") {
       const value = await askChoice("Private chats only", ["true", "false"], config.ALLOW_PRIVATE_CHATS_ONLY);
       if (value) config.ALLOW_PRIVATE_CHATS_ONLY = value;
@@ -461,16 +479,15 @@ async function askText(label, initial = "", options = {}) {
       style: { border: { fg: "green" }, fg: "white", bg: "black" },
     });
 
-    blessed.text({
+    let hidden = false;
+    const hint = blessed.text({
       parent: box,
       top: 0,
       left: 1,
       right: 1,
       height: 2,
       tags: true,
-      content: options.secret
-        ? "Paste/type value. Enter = save, Esc = cancel. Input is hidden."
-        : "Paste/type value. Enter = save, Esc = cancel.",
+      content: "",
     });
 
     const input = blessed.textbox({
@@ -486,10 +503,18 @@ async function askText(label, initial = "", options = {}) {
       height: 3,
       border: "line",
       style: { border: { fg: "cyan" }, fg: "white", bg: "black" },
-      censor: Boolean(options.secret),
+      censor: false,
       secret: false,
       value: String(initial ?? ""),
     });
+
+    const updateHint = () => {
+      hint.setContent(
+        options.secret
+          ? `Paste/type value. Enter = save, Esc = cancel, F2 = ${hidden ? "show" : "hide"}. Currently ${hidden ? "hidden" : "visible"}.`
+          : "Paste/type value. Enter = save, Esc = cancel."
+      );
+    };
 
     const cleanup = (value) => {
       box.destroy();
@@ -500,7 +525,16 @@ async function askText(label, initial = "", options = {}) {
     input.on("submit", (value) => cleanup(typeof value === "string" ? value.trim() : ""));
     input.key(["escape"], () => cleanup(null));
     box.key(["escape"], () => cleanup(null));
+    if (options.secret) {
+      input.key(["f2"], () => {
+        hidden = !hidden;
+        input.censor = hidden;
+        updateHint();
+        screen.render();
+      });
+    }
 
+    updateHint();
     input.focus();
     input.readInput();
     screen.render();
@@ -535,24 +569,33 @@ async function askChoice(label, options, current) {
 
 async function askYesNo(message, defaultYes = true) {
   return new Promise((resolve) => {
-    const question = blessed.question({
+    const box = blessed.box({
       parent: screen,
       border: "line",
       width: "80%",
-      height: 12,
+      height: 14,
       top: "center",
       left: "center",
       label: " Confirm ",
       tags: true,
       keys: true,
       vi: true,
+      scrollable: true,
+      alwaysScroll: true,
       style: { border: { fg: "green" } },
+      content: `${escapeTags(message)}\n\n${defaultYes ? "Enter/Y = yes, N = no, Esc = cancel" : "Enter/N = no, Y = yes, Esc = cancel"}`,
     });
-    question.ask(`${escapeTags(message)}\n\n${defaultYes ? "[Y/n]" : "[y/N]"}`, (value) => {
-      question.destroy();
+
+    const finish = (value) => {
+      box.destroy();
       screen.render();
-      resolve(Boolean(value));
-    });
+      resolve(value);
+    };
+
+    box.key(["enter", "y", "Y"], () => finish(true));
+    box.key(["n", "N"], () => finish(false));
+    box.key(["escape", "q"], () => finish(null));
+    box.focus();
     screen.render();
   });
 }
