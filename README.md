@@ -87,9 +87,13 @@ If pi itself is not configured correctly, this bridge will not be able to answer
 
 ## TUI preview
 
-![TUI screenshot](docs/media/tui-screenshot.png)
+<p align="center">
+  <img src="./docs/media/tui-screenshot.png" alt="Telegram Pi Bridge TUI screenshot" width="900" />
+</p>
 
-![TUI demo](docs/media/tui-demo.gif)
+<p align="center">
+  <img src="./docs/media/tui-demo.gif" alt="Telegram Pi Bridge TUI demo" width="900" />
+</p>
 
 ## Security model
 
