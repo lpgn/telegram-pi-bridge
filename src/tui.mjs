@@ -445,13 +445,13 @@ async function runConfigurationTest() {
   outputBox.setContent(lines.join("\n"));
 }
 
-async function askText(label, initial = "", _options = {}) {
+async function askText(label, initial = "", options = {}) {
   return new Promise((resolve) => {
-    const prompt = blessed.prompt({
+    const box = blessed.box({
       parent: screen,
       border: "line",
-      height: 9,
-      width: "80%",
+      height: 11,
+      width: "82%",
       top: "center",
       left: "center",
       label: ` ${label} `,
@@ -460,12 +460,49 @@ async function askText(label, initial = "", _options = {}) {
       vi: true,
       style: { border: { fg: "green" }, fg: "white", bg: "black" },
     });
-    prompt.input(label, String(initial ?? ""), (_err, value) => {
-      prompt.destroy();
-      screen.render();
-      if (typeof value !== "string") return resolve(null);
-      resolve(value.trim());
+
+    blessed.text({
+      parent: box,
+      top: 0,
+      left: 1,
+      right: 1,
+      height: 2,
+      tags: true,
+      content: options.secret
+        ? "Paste/type value. Enter = save, Esc = cancel. Input is hidden."
+        : "Paste/type value. Enter = save, Esc = cancel.",
     });
+
+    const input = blessed.textbox({
+      parent: box,
+      name: "value",
+      inputOnFocus: true,
+      mouse: true,
+      keys: true,
+      vi: true,
+      top: 3,
+      left: 1,
+      right: 1,
+      height: 3,
+      border: "line",
+      style: { border: { fg: "cyan" }, fg: "white", bg: "black" },
+      censor: Boolean(options.secret),
+      secret: false,
+      value: String(initial ?? ""),
+    });
+
+    const cleanup = (value) => {
+      box.destroy();
+      screen.render();
+      resolve(value);
+    };
+
+    input.on("submit", (value) => cleanup(typeof value === "string" ? value.trim() : ""));
+    input.key(["escape"], () => cleanup(null));
+    box.key(["escape"], () => cleanup(null));
+
+    input.focus();
+    input.readInput();
     screen.render();
   });
 }

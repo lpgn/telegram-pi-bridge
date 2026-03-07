@@ -1,4 +1,4 @@
-import { appendFile, mkdir, rm } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -20,6 +20,7 @@ const BASE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const DATA_DIR = path.join(BASE_DIR, "data");
 const LOGS_DIR = path.join(BASE_DIR, "logs");
 const SESSIONS_DIR = path.join(DATA_DIR, "sessions");
+const UNLOCK_STATE_FILE = process.env.UNLOCK_STATE_FILE?.trim() || path.join(DATA_DIR, "unlock-state.json");
 const TELEGRAM_BOT_TOKEN = requiredEnv("TELEGRAM_BOT_TOKEN");
 const OWNER_TELEGRAM_USER_ID = requiredNumericEnv("OWNER_TELEGRAM_USER_ID");
 const OWNER_CHAT_ID = optionalNumericEnv("OWNER_CHAT_ID");
@@ -128,6 +129,8 @@ const unlockState = {
 
 await mkdir(SESSIONS_DIR, { recursive: true });
 await mkdir(path.dirname(AUDIT_LOG_FILE), { recursive: true });
+await mkdir(path.dirname(UNLOCK_STATE_FILE), { recursive: true });
+await loadUnlockState();
 
 bot.use(async (ctx, next) => {
   const decision = await authorize(ctx);
@@ -171,12 +174,13 @@ bot.command("unlock", async (ctx) => {
 
   unlockState.unlockedUntil = Date.now() + UNLOCK_TTL_MINUTES * 60_000;
   unlockState.unlockedBy = ctx.from?.id ?? null;
+  await saveUnlockState();
   await audit("UNLOCK_SUCCESS", ctx, { unlockedUntil: new Date(unlockState.unlockedUntil).toISOString() });
   await ctx.reply(`Unlocked for ${UNLOCK_TTL_MINUTES} minutes.`);
 });
 
 bot.command("lock", async (ctx) => {
-  lockNow();
+  await lockNow();
   await audit("LOCK", ctx, {});
   await ctx.reply("Locked.");
 });
@@ -247,7 +251,7 @@ bot.on("message:text", async (ctx) => {
     } finally {
       clearInterval(typingTimer);
       if (Date.now() >= unlockState.unlockedUntil) {
-        lockNow();
+        await lockNow();
       }
     }
   });
@@ -283,16 +287,50 @@ await appendAuditLine({
   ownerChatId: OWNER_CHAT_ID,
   unlockMethod: UNLOCK_METHOD,
   privateOnly: ALLOW_PRIVATE_CHATS_ONLY,
+  unlockedUntil: unlockState.unlockedUntil || null,
 });
-await bot.start();
+await startBotWithRetry();
 
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log("Shutting down Telegram pi bridge...");
+  bot.stop();
   await appendAuditLine({ time: new Date().toISOString(), event: "SHUTDOWN" });
   await sessionPool.disposeAll();
   process.exit(0);
+}
+
+async function startBotWithRetry() {
+  while (!shuttingDown) {
+    try {
+      await bot.start();
+      return;
+    } catch (error) {
+      if (shuttingDown) return;
+
+      const description = error?.description || error?.message || String(error);
+      const isConflict = error?.error_code === 409 || /other getUpdates request/i.test(description);
+      const retryDelayMs = isConflict ? 5000 : 15000;
+      const event = isConflict ? "BOT_POLL_CONFLICT" : "BOT_START_ERROR";
+
+      try {
+        bot.stop();
+      } catch {
+        // Ignore stop failures during retry.
+      }
+
+      console.error(`Telegram bridge ${isConflict ? "poll conflict" : "start error"}:`, error);
+      await appendAuditLine({
+        time: new Date().toISOString(),
+        event,
+        error: description,
+        retryDelayMs,
+      });
+
+      await sleep(retryDelayMs);
+    }
+  }
 }
 
 async function authorize(ctx) {
@@ -374,9 +412,46 @@ function isLocked() {
   return Date.now() >= unlockState.unlockedUntil;
 }
 
-function lockNow() {
+async function lockNow() {
   unlockState.unlockedUntil = 0;
   unlockState.unlockedBy = null;
+  await saveUnlockState();
+}
+
+async function loadUnlockState() {
+  try {
+    const raw = await readFile(UNLOCK_STATE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    unlockState.unlockedUntil = Number(parsed?.unlockedUntil) || 0;
+    unlockState.unlockedBy = parsed?.unlockedBy ?? null;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.error("Failed to load unlock state:", error);
+    }
+    unlockState.unlockedUntil = 0;
+    unlockState.unlockedBy = null;
+  }
+
+  if (Date.now() >= unlockState.unlockedUntil) {
+    unlockState.unlockedUntil = 0;
+    unlockState.unlockedBy = null;
+    await saveUnlockState();
+  }
+}
+
+async function saveUnlockState() {
+  const payload = JSON.stringify(
+    {
+      unlockedUntil: unlockState.unlockedUntil,
+      unlockedBy: unlockState.unlockedBy,
+      savedAt: new Date().toISOString(),
+    },
+    null,
+    2
+  );
+  const tempFile = `${UNLOCK_STATE_FILE}.tmp`;
+  await writeFile(tempFile, `${payload}\n`, "utf8");
+  await rename(tempFile, UNLOCK_STATE_FILE);
 }
 
 function verifyUnlockCode(code) {
@@ -539,4 +614,8 @@ function safePreview(text) {
 function parseBoolean(value, fallback) {
   if (value == null || value === "") return fallback;
   return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
