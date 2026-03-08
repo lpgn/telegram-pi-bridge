@@ -5,6 +5,18 @@ import { fileURLToPath } from "node:url";
 
 export const PACKAGE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const APP_DIR = resolveAppDir();
+export const DATA_DIR = path.join(APP_DIR, "data");
+export const LOGS_DIR = path.join(APP_DIR, "logs");
+export const SESSIONS_DIR = path.join(DATA_DIR, "sessions");
+
+export function expandHome(input) {
+  if (!input.startsWith("~")) return input;
+  return path.join(os.homedir(), input.slice(1));
+}
+
+export function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function resolveAppDir() {
   const override = process.env.TELEPI_HOME?.trim() || process.env.TELEPI_APP_DIR?.trim();
@@ -20,9 +32,4 @@ function resolveAppDir() {
   }
 
   return PACKAGE_DIR;
-}
-
-function expandHome(input) {
-  if (!input.startsWith("~")) return input;
-  return path.join(os.homedir(), input.slice(1));
 }

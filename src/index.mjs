@@ -1,6 +1,5 @@
 import { appendFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import crypto from "node:crypto";
-import os from "node:os";
 import path from "node:path";
 
 import dotenv from "dotenv";
@@ -12,14 +11,9 @@ import {
   ModelRegistry,
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
-import { APP_DIR } from "./paths.mjs";
+import { APP_DIR, DATA_DIR, LOGS_DIR, SESSIONS_DIR, expandHome, sleep } from "./paths.mjs";
 
 dotenv.config({ path: path.join(APP_DIR, ".env") });
-
-const BASE_DIR = APP_DIR;
-const DATA_DIR = path.join(APP_DIR, "data");
-const LOGS_DIR = path.join(APP_DIR, "logs");
-const SESSIONS_DIR = path.join(DATA_DIR, "sessions");
 const UNLOCK_STATE_FILE = process.env.UNLOCK_STATE_FILE?.trim() || path.join(DATA_DIR, "unlock-state.json");
 const TELEGRAM_BOT_TOKEN = requiredEnv("TELEGRAM_BOT_TOKEN");
 const OWNER_TELEGRAM_USER_ID = requiredNumericEnv("OWNER_TELEGRAM_USER_ID");
@@ -132,12 +126,11 @@ class PiSessionPool {
   }
 
   async disposeAll() {
-    const entries = Array.from(this.sessions.values());
+    const entries = [...this.sessions.values()];
     this.sessions.clear();
     for (const entry of entries) {
       try {
-        const session = await entry;
-        session.dispose();
+        (await entry).dispose();
       } catch {
         // Ignore dispose failures.
       }
@@ -222,58 +215,54 @@ bot.command("lock", async (ctx) => {
   await ctx.reply("Locked.");
 });
 
-bot.command("clear", async (ctx) => {
-  if (!(await requireUnlocked(ctx, "CLEAR_DENIED_LOCKED"))) return;
-
-  await withChatLock(ctx.chat.id, async () => {
-    await sessionPool.clear(ctx.chat.id);
-    await audit("CLEAR", ctx, {});
-    await ctx.reply("Cleared this chat's pi session.");
-  });
+const protectedRoute = bot.filter(async (ctx) => {
+  if (isLocked()) {
+    await audit("DENIED_LOCKED", ctx, { command: ctx.message?.text });
+    await ctx.reply("Locked. Use /unlock first.");
+    return false;
+  }
+  return true;
 });
 
-bot.command("new", async (ctx) => {
-  if (!(await requireUnlocked(ctx, "NEW_DENIED_LOCKED"))) return;
-
-  await withChatLock(ctx.chat.id, async () => {
-    const session = await sessionPool.newSession(ctx.chat.id);
-    await audit("NEW_SESSION", ctx, { sessionId: session.sessionId, sessionFile: session.sessionFile });
-    await ctx.reply("Started a fresh session for this chat.");
-  });
+protectedRoute.use(async (ctx, next) => {
+  if (!ctx.chat?.id) return next();
+  return withChatLock(ctx.chat.id, () => next());
 });
 
-bot.command("session", async (ctx) => {
-  if (!(await requireUnlocked(ctx, "SESSION_DENIED_LOCKED"))) return;
-
-  await withChatLock(ctx.chat.id, async () => {
-    const session = await sessionPool.get(ctx.chat.id);
-    const stats = session.getSessionStats();
-    await audit("SESSION_INFO", ctx, { sessionId: stats.sessionId, sessionFile: stats.sessionFile });
-    await ctx.reply(formatSessionInfo(session, stats, ctx.chat.id));
-  });
+protectedRoute.command("clear", async (ctx) => {
+  await sessionPool.clear(ctx.chat.id);
+  await audit("CLEAR", ctx, {});
+  await ctx.reply("Cleared this chat's pi session.");
 });
 
-bot.command("compact", async (ctx) => {
-  if (!(await requireUnlocked(ctx, "COMPACT_DENIED_LOCKED"))) return;
+protectedRoute.command("new", async (ctx) => {
+  const session = await sessionPool.newSession(ctx.chat.id);
+  await audit("NEW_SESSION", ctx, { sessionId: session.sessionId, sessionFile: session.sessionFile });
+  await ctx.reply("Started a fresh session for this chat.");
+});
 
+protectedRoute.command("session", async (ctx) => {
+  const session = await sessionPool.get(ctx.chat.id);
+  const stats = session.getSessionStats();
+  await audit("SESSION_INFO", ctx, { sessionId: stats.sessionId, sessionFile: stats.sessionFile });
+  await ctx.reply(formatSessionInfo(session, stats, ctx.chat.id));
+});
+
+protectedRoute.command("compact", async (ctx) => {
   const instructions = commandArgs(ctx.message?.text);
-  await withChatLock(ctx.chat.id, async () => {
-    try {
-      await ctx.api.sendChatAction(ctx.chat.id, "typing");
-      const session = await sessionPool.get(ctx.chat.id);
-      await session.compact(instructions || undefined);
-      await audit("COMPACT", ctx, { customInstructions: Boolean(instructions), sessionId: session.sessionId });
-      await ctx.reply(instructions ? "Compacted session with custom instructions." : "Compacted session.");
-    } catch (error) {
-      await audit("COMPACT_ERROR", ctx, { error: error?.message || String(error) });
-      await ctx.reply(`Compaction failed: ${error?.message || String(error)}`);
-    }
-  });
+  try {
+    await ctx.api.sendChatAction(ctx.chat.id, "typing");
+    const session = await sessionPool.get(ctx.chat.id);
+    await session.compact(instructions || undefined);
+    await audit("COMPACT", ctx, { customInstructions: Boolean(instructions), sessionId: session.sessionId });
+    await ctx.reply(instructions ? "Compacted session with custom instructions." : "Compacted session.");
+  } catch (error) {
+    await audit("COMPACT_ERROR", ctx, { error: error?.message || String(error) });
+    await ctx.reply(`Compaction failed: ${error?.message || String(error)}`);
+  }
 });
 
-bot.command("name", async (ctx) => {
-  if (!(await requireUnlocked(ctx, "NAME_DENIED_LOCKED"))) return;
-
+protectedRoute.command("name", async (ctx) => {
   const name = commandArgs(ctx.message?.text);
   if (!name) {
     await audit("NAME_MISSING", ctx, {});
@@ -281,72 +270,66 @@ bot.command("name", async (ctx) => {
     return;
   }
 
-  await withChatLock(ctx.chat.id, async () => {
-    const session = await sessionPool.get(ctx.chat.id);
-    session.setSessionName(name);
-    await audit("SESSION_NAMED", ctx, { sessionId: session.sessionId, name });
-    await ctx.reply(`Named this session: ${name}`);
-  });
+  const session = await sessionPool.get(ctx.chat.id);
+  session.setSessionName(name);
+  await audit("SESSION_NAMED", ctx, { sessionId: session.sessionId, name });
+  await ctx.reply(`Named this session: ${name}`);
 });
 
-bot.command("resume", async (ctx) => {
-  if (!(await requireUnlocked(ctx, "RESUME_DENIED_LOCKED"))) return;
-
+protectedRoute.command("resume", async (ctx) => {
   const arg = commandArgs(ctx.message?.text);
-  await withChatLock(ctx.chat.id, async () => {
-    const sessions = await sessionPool.list(ctx.chat.id);
-    if (!sessions.length) {
-      await audit("RESUME_EMPTY", ctx, {});
-      await ctx.reply("No saved sessions found for this chat.");
+  const sessions = await sessionPool.list(ctx.chat.id);
+  if (!sessions.length) {
+    await audit("RESUME_EMPTY", ctx, {});
+    await ctx.reply("No saved sessions found for this chat.");
+    return;
+  }
+
+  if (!arg) {
+    await audit("RESUME_LIST", ctx, { count: sessions.length });
+    await ctx.reply(formatResumeList(sessions));
+    return;
+  }
+
+  const index = Number(arg);
+  let selected;
+  let selectedIndex = null;
+
+  if (Number.isInteger(index) && index >= 1 && index <= sessions.length) {
+    selectedIndex = index;
+    selected = sessions[index - 1];
+  } else {
+    const matches = sessions.filter((entry) => {
+      const name = String(entry.name || "").trim().toLowerCase();
+      const query = arg.trim().toLowerCase();
+      return name && (name === query || name.startsWith(query));
+    });
+
+    if (matches.length === 1) {
+      selected = matches[0];
+      selectedIndex = sessions.findIndex((entry) => entry.path === selected.path) + 1;
+    } else if (matches.length > 1) {
+      await audit("RESUME_AMBIGUOUS_NAME", ctx, { arg, matches: matches.length });
+      await ctx.reply(`More than one session matches '${arg}'. Use /resume to list them, then choose a number.`);
       return;
-    }
-
-    if (!arg) {
-      await audit("RESUME_LIST", ctx, { count: sessions.length });
-      await ctx.reply(formatResumeList(sessions));
-      return;
-    }
-
-    const index = Number(arg);
-    let selected;
-    let selectedIndex = null;
-
-    if (Number.isInteger(index) && index >= 1 && index <= sessions.length) {
-      selectedIndex = index;
-      selected = sessions[index - 1];
     } else {
-      const matches = sessions.filter((entry) => {
-        const name = String(entry.name || "").trim().toLowerCase();
-        const query = arg.trim().toLowerCase();
-        return name && (name === query || name.startsWith(query));
-      });
-
-      if (matches.length === 1) {
-        selected = matches[0];
-        selectedIndex = sessions.findIndex((entry) => entry.path === selected.path) + 1;
-      } else if (matches.length > 1) {
-        await audit("RESUME_AMBIGUOUS_NAME", ctx, { arg, matches: matches.length });
-        await ctx.reply(`More than one session matches '${arg}'. Use /resume to list them, then choose a number.`);
-        return;
-      } else {
-        await audit("RESUME_BAD_TARGET", ctx, { arg, count: sessions.length });
-        await ctx.reply(`No session matched '${arg}'. Use /resume to list sessions, then pick a number or exact name.`);
-        return;
-      }
+      await audit("RESUME_BAD_TARGET", ctx, { arg, count: sessions.length });
+      await ctx.reply(`No session matched '${arg}'. Use /resume to list sessions, then pick a number or exact name.`);
+      return;
     }
+  }
 
-    const session = await sessionPool.resume(ctx.chat.id, selected.path);
-    await audit("RESUME_OPEN", ctx, { index: selectedIndex, sessionId: session.sessionId, sessionFile: session.sessionFile });
-    await ctx.reply([
-      `Resumed session ${selectedIndex}.`,
-      `Name: ${selected.name || "(unnamed)"}`,
-      `Updated: ${selected.modified.toISOString()}`,
-      `First message: ${safePreview(selected.firstMessage || "") || "(empty)"}`,
-    ].join("\n"));
-  });
+  const session = await sessionPool.resume(ctx.chat.id, selected.path);
+  await audit("RESUME_OPEN", ctx, { index: selectedIndex, sessionId: session.sessionId, sessionFile: session.sessionFile });
+  await ctx.reply([
+    `Resumed session ${selectedIndex}.`,
+    `Name: ${selected.name || "(unnamed)"}`,
+    `Updated: ${selected.modified.toISOString()}`,
+    `First message: ${safePreview(selected.firstMessage || "") || "(empty)"}`,
+  ].join("\n"));
 });
 
-bot.on("message:text", async (ctx) => {
+protectedRoute.on("message:text", async (ctx) => {
   const text = ctx.message.text?.trim();
   if (!text) return;
   if (text.startsWith("/")) return;
@@ -357,51 +340,43 @@ bot.on("message:text", async (ctx) => {
     return;
   }
 
-  if (isLocked()) {
-    await audit("PROMPT_DENIED_LOCKED", ctx, {});
-    await ctx.reply("Locked. Use /unlock first.");
-    return;
-  }
+  const typingTimer = setInterval(() => {
+    ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => { });
+  }, TYPING_INTERVAL_MS);
 
-  await withChatLock(ctx.chat.id, async () => {
-    const typingTimer = setInterval(() => {
-      ctx.api.sendChatAction(ctx.chat.id, "typing").catch(() => {});
-    }, TYPING_INTERVAL_MS);
+  try {
+    await audit("PROMPT_START", ctx, { preview: safePreview(text) });
+    await ctx.api.sendChatAction(ctx.chat.id, "typing");
+    const session = await sessionPool.get(ctx.chat.id);
+    let replyText = "";
+
+    const unsubscribe = session.subscribe((event) => {
+      if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+        replyText += event.assistantMessageEvent.delta;
+      }
+    });
 
     try {
-      await audit("PROMPT_START", ctx, { preview: safePreview(text) });
-      await ctx.api.sendChatAction(ctx.chat.id, "typing");
-      const session = await sessionPool.get(ctx.chat.id);
-      let replyText = "";
-
-      const unsubscribe = session.subscribe((event) => {
-        if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-          replyText += event.assistantMessageEvent.delta;
-        }
-      });
-
-      try {
-        await session.prompt(text);
-      } finally {
-        unsubscribe();
-      }
-
-      replyText = replyText.trim() || "(No text response produced.)";
-      for (const chunk of splitForTelegram(replyText)) {
-        await ctx.reply(chunk);
-      }
-      await audit("PROMPT_END", ctx, { responseLength: replyText.length });
-    } catch (error) {
-      console.error(`Chat ${ctx.chat.id} failed:`, error);
-      await audit("PROMPT_ERROR", ctx, { error: error?.message || String(error) });
-      await ctx.reply("Request failed. See logs.");
+      await session.prompt(text);
     } finally {
-      clearInterval(typingTimer);
-      if (Date.now() >= unlockState.unlockedUntil) {
-        await lockNow();
-      }
+      unsubscribe();
     }
-  });
+
+    replyText = replyText.trim() || "(No text response produced.)";
+    for (const chunk of splitForTelegram(replyText)) {
+      await ctx.reply(chunk);
+    }
+    await audit("PROMPT_END", ctx, { responseLength: replyText.length });
+  } catch (error) {
+    console.error(`Chat ${ctx.chat.id} failed:`, error);
+    await audit("PROMPT_ERROR", ctx, { error: error?.message || String(error) });
+    await ctx.reply("Request failed. See logs.");
+  } finally {
+    clearInterval(typingTimer);
+    if (Date.now() >= unlockState.unlockedUntil) {
+      await lockNow();
+    }
+  }
 });
 
 bot.catch(async (error) => {
@@ -424,7 +399,7 @@ process.on("SIGUSR1", () => {
       time: new Date().toISOString(),
       event: "LOCAL_UNLOCK_ERROR",
       error: error?.message || String(error),
-    }).catch(() => {});
+    }).catch(() => { });
   });
 });
 
@@ -565,6 +540,13 @@ async function alertOwner(text, fingerprint = "default") {
   if (now - last < ALERT_DEDUP_WINDOW_MS) return;
   recentAlerts.set(fingerprint, now);
 
+  // Prune stale entries to prevent unbounded memory growth
+  if (recentAlerts.size > 100) {
+    for (const [key, timestamp] of recentAlerts) {
+      if (now - timestamp >= ALERT_DEDUP_WINDOW_MS) recentAlerts.delete(key);
+    }
+  }
+
   try {
     await bot.api.sendMessage(OWNER_CHAT_ID ?? OWNER_TELEGRAM_USER_ID, text);
   } catch (error) {
@@ -583,6 +565,7 @@ function isLocked() {
 }
 
 async function lockNow() {
+  if (unlockState.unlockedUntil === 0) return;
   unlockState.unlockedUntil = 0;
   unlockState.unlockedBy = null;
   await saveUnlockState();
@@ -667,24 +650,27 @@ function decodeBase32(input) {
     .replace(/\s+/g, "");
   if (!clean) throw new Error("UNLOCK_TOTP_SECRET is empty");
 
-  let bits = "";
+  const out = Buffer.alloc(Math.floor((clean.length * 5) / 8));
+  let bits = 0;
+  let value = 0;
+  let index = 0;
   for (const char of clean) {
-    const value = alphabet.indexOf(char);
-    if (value === -1) throw new Error("UNLOCK_TOTP_SECRET must be base32 encoded");
-    bits += value.toString(2).padStart(5, "0");
+    const v = alphabet.indexOf(char);
+    if (v === -1) throw new Error("UNLOCK_TOTP_SECRET must be base32 encoded");
+    value = (value << 5) | v;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      out[index++] = (value >>> bits) & 0xff;
+    }
   }
-
-  const bytes = [];
-  for (let i = 0; i + 8 <= bits.length; i += 8) {
-    bytes.push(Number.parseInt(bits.slice(i, i + 8), 2));
-  }
-  return Buffer.from(bytes);
+  return out.subarray(0, index);
 }
 
 function safeEqual(a, b) {
-  const left = Buffer.from(String(a));
-  const right = Buffer.from(String(b));
-  if (left.length !== right.length) return false;
+  // Hash both inputs to fixed-length digests to avoid leaking length info
+  const left = crypto.createHash("sha256").update(String(a)).digest();
+  const right = crypto.createHash("sha256").update(String(b)).digest();
   return crypto.timingSafeEqual(left, right);
 }
 
@@ -708,17 +694,9 @@ function optionalNumericEnv(name) {
   return value;
 }
 
-function expandHome(input) {
-  if (!input.startsWith("~")) return input;
-  return path.join(os.homedir(), input.slice(1));
-}
+// expandHome is imported from ./paths.mjs
 
-async function requireUnlocked(ctx, event) {
-  if (!isLocked()) return true;
-  await audit(event, ctx, {});
-  await ctx.reply("Locked. Use /unlock first.");
-  return false;
-}
+
 
 function helpText() {
   return [
@@ -745,7 +723,7 @@ function formatSessionInfo(session, stats, chatId) {
     `Session ID: ${stats.sessionId}`,
     `Name: ${session.sessionName || "(unnamed)"}`,
     `File: ${stats.sessionFile || "(none)"}`,
-    `Messages: ${stats.totalMessages} total (${stats.userMessages} user, ${stats.assistantMessages} assistant, ${stats.toolCalls} tool calls)` ,
+    `Messages: ${stats.totalMessages} total (${stats.userMessages} user, ${stats.assistantMessages} assistant, ${stats.toolCalls} tool calls)`,
     `Tokens: ${stats.tokens.total} total (${stats.tokens.input} in, ${stats.tokens.output} out, ${stats.tokens.cacheRead} cache read, ${stats.tokens.cacheWrite} cache write)`,
     `Cost: ${formatCost(stats.cost)}`,
     `State: ${isLocked() ? "locked" : `unlocked until ${new Date(unlockState.unlockedUntil).toISOString()}`}`,
@@ -844,6 +822,4 @@ function parseBoolean(value, fallback) {
   return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+// sleep is imported from ./paths.mjs

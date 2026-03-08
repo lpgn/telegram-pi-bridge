@@ -3,11 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { APP_DIR, PACKAGE_DIR } from "./paths.mjs";
+import { APP_DIR, DATA_DIR, LOGS_DIR, PACKAGE_DIR, sleep } from "./paths.mjs";
 
 export const BASE_DIR = APP_DIR;
 export const RUN_DIR = path.join(APP_DIR, "run");
-export const LOG_DIR = path.join(APP_DIR, "logs");
+export const LOG_DIR = LOGS_DIR;
 export const SHARE_DIR = path.join(APP_DIR, "share");
 export const PID_FILE = path.join(RUN_DIR, "bridge.pid");
 export const OUT_LOG = path.join(APP_DIR, "bridge.out");
@@ -20,6 +20,7 @@ export const SYSTEMD_LOCAL_FILE = path.join(SYSTEMD_DIR, "telepi.service");
 export const SYSTEMD_TEMPLATE_FILE = path.join(PACKAGE_DIR, "systemd", "telepi.service.example");
 export const PI_AUTH_FILE = path.join(os.homedir(), ".pi", "agent", "auth.json");
 export const SYSTEMD_UNIT = "telepi.service";
+const ENTRYPOINT_BASENAME = path.basename(ENTRYPOINT);
 const execFileAsync = promisify(execFile);
 
 export async function ensureRuntimeDirs() {
@@ -245,9 +246,17 @@ export async function restartBridge() {
 
 export async function readLogTail(logPath, maxBytes = 24000) {
   try {
-    const file = await readFile(logPath, "utf8");
-    if (file.length <= maxBytes) return file;
-    return file.slice(-maxBytes);
+    const info = await stat(logPath);
+    if (info.size <= maxBytes) return await readFile(logPath, "utf8");
+    // Read only the tail portion from disk to avoid OOM on large logs
+    const fd = await open(logPath, "r");
+    try {
+      const buf = Buffer.alloc(maxBytes);
+      const { bytesRead } = await fd.read(buf, 0, maxBytes, info.size - maxBytes);
+      return buf.subarray(0, bytesRead).toString("utf8");
+    } finally {
+      await fd.close();
+    }
   } catch (error) {
     return `[missing] ${logPath}\n${error.message || String(error)}`;
   }
@@ -304,28 +313,37 @@ export async function readEnvFile() {
   return parseEnv(raw);
 }
 
+const CONFIG_DEFAULTS = {
+  TELEGRAM_BOT_TOKEN: "",
+  OWNER_TELEGRAM_USER_ID: "",
+  OWNER_CHAT_ID: "",
+  ALLOW_PRIVATE_CHATS_ONLY: "true",
+  UNLOCK_METHOD: "totp",
+  UNLOCK_TOTP_SECRET: "",
+  UNLOCK_SHARED_SECRET: "",
+  UNLOCK_TTL_MINUTES: "15",
+  UNLOCK_STATE_FILE: path.join(DATA_DIR, "unlock-state.json"),
+  ALERT_OWNER_ON_DENIED: "true",
+  AUDIT_LOG_FILE: AUDIT_LOG,
+  MAX_TEXT_LENGTH: "12000",
+  PI_WORKSPACE_DIR: process.cwd(),
+  PI_AGENT_DIR: "~/.pi/agent",
+  PI_MODEL_PROVIDER: "",
+  PI_MODEL_NAME: "",
+  PI_THINKING_LEVEL: "medium",
+};
+
 export async function getEffectiveConfig() {
   const envStatus = await getEnvStatus();
-  const env = envStatus.values || {};
-  return {
-    TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN || "",
-    OWNER_TELEGRAM_USER_ID: env.OWNER_TELEGRAM_USER_ID || "",
-    OWNER_CHAT_ID: env.OWNER_CHAT_ID || "",
-    ALLOW_PRIVATE_CHATS_ONLY: env.ALLOW_PRIVATE_CHATS_ONLY || "true",
-    UNLOCK_METHOD: env.UNLOCK_METHOD || "totp",
-    UNLOCK_TOTP_SECRET: env.UNLOCK_TOTP_SECRET || "",
-    UNLOCK_SHARED_SECRET: env.UNLOCK_SHARED_SECRET || "",
-    UNLOCK_TTL_MINUTES: env.UNLOCK_TTL_MINUTES || "15",
-    UNLOCK_STATE_FILE: env.UNLOCK_STATE_FILE || path.join(BASE_DIR, "data", "unlock-state.json"),
-    ALERT_OWNER_ON_DENIED: env.ALERT_OWNER_ON_DENIED || "true",
-    AUDIT_LOG_FILE: env.AUDIT_LOG_FILE || AUDIT_LOG,
-    MAX_TEXT_LENGTH: env.MAX_TEXT_LENGTH || "12000",
-    PI_WORKSPACE_DIR: env.PI_WORKSPACE_DIR || process.cwd(),
-    PI_AGENT_DIR: env.PI_AGENT_DIR || "~/.pi/agent",
-    PI_MODEL_PROVIDER: env.PI_MODEL_PROVIDER || "",
-    PI_MODEL_NAME: env.PI_MODEL_NAME || "",
-    PI_THINKING_LEVEL: env.PI_THINKING_LEVEL || "medium",
-  };
+  return { ...CONFIG_DEFAULTS, ...filterEmpty(envStatus.values || {}) };
+}
+
+function filterEmpty(obj) {
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v !== undefined && v !== "") out[k] = v;
+  }
+  return out;
 }
 
 export async function writeEnvConfig(config) {
@@ -396,16 +414,18 @@ export function renderSystemdService({ workingDirectory, user }) {
 
 export async function testConfiguration() {
   const envStatus = await getEnvStatus();
-  const checks = [];
-  checks.push({ name: ".env file", ok: envStatus.exists, details: ENV_FILE });
-  checks.push({ name: "Config completeness", ok: envStatus.configured, details: envStatus.issues.join("; ") || "ok" });
-  const piAuth = await safeStat(PI_AUTH_FILE);
-  checks.push({ name: "pi auth", ok: Boolean(piAuth), details: PI_AUTH_FILE });
-  const localService = await safeStat(SYSTEMD_LOCAL_FILE);
-  checks.push({ name: "Local systemd service", ok: Boolean(localService), details: SYSTEMD_LOCAL_FILE });
-  const templateService = await safeStat(SYSTEMD_TEMPLATE_FILE);
-  checks.push({ name: "Service example template", ok: Boolean(templateService), details: SYSTEMD_TEMPLATE_FILE });
-  return checks;
+  const [piAuth, localService, templateService] = await Promise.all([
+    safeStat(PI_AUTH_FILE),
+    safeStat(SYSTEMD_LOCAL_FILE),
+    safeStat(SYSTEMD_TEMPLATE_FILE),
+  ]);
+  return [
+    { name: ".env file", ok: envStatus.exists, details: ENV_FILE },
+    { name: "Config completeness", ok: envStatus.configured, details: envStatus.issues.join("; ") || "ok" },
+    { name: "pi auth", ok: Boolean(piAuth), details: PI_AUTH_FILE },
+    { name: "Local systemd service", ok: Boolean(localService), details: SYSTEMD_LOCAL_FILE },
+    { name: "Service example template", ok: Boolean(templateService), details: SYSTEMD_TEMPLATE_FILE },
+  ];
 }
 
 function parseEnv(raw) {
@@ -522,9 +542,14 @@ async function listBridgeProcesses() {
       if (!Number.isFinite(pid) || pid === process.pid || !isPidRunning(pid)) continue;
 
       let kind = null;
-      if (args.includes("sh -c node src/index.mjs")) {
+      if (args.includes("sh -c node src/index.mjs") || args.includes(`sh -c node ${ENTRYPOINT}`)) {
         kind = "bridge-shell";
-      } else if (args.includes(ENTRYPOINT) || args.includes("node src/index.mjs")) {
+      } else if (
+        args.includes(ENTRYPOINT) ||
+        args.includes("node src/index.mjs") ||
+        args.includes(`node ${ENTRYPOINT_BASENAME}`) ||
+        args.endsWith(`/${ENTRYPOINT_BASENAME}`)
+      ) {
         kind = "bridge-node";
       }
 
@@ -595,6 +620,4 @@ async function waitForExit(pid, timeoutMs) {
   return !isPidRunning(pid);
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+// sleep is imported from ./paths.mjs
