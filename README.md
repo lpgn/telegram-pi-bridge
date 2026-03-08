@@ -112,7 +112,11 @@ cd ~/telepi
 cp "$(npm root -g)/@lpgn/telepi/.env.example" .env
 ```
 
-> **Note:** If you get an `EACCES` permission error during the global install, it means your node environment needs `sudo` (e.g. `sudo npm install -g @lpgn/telepi`), or you should configure npm to use a user-owned directory for global packages (like using `nvm`).
+> **Troubleshooting Global Installs:**
+> 1. **`EACCES` permissions error:** Your node environment needs `sudo` (e.g., `sudo npm install -g @lpgn/telepi`), or you should configure npm to use a user-owned directory for global packages (highly recommended, tools like `nvm` do this automatically).
+> 2. **`command not found: telepi` after installing:** If npm successfully installed the package into a custom directory (like `~/.npm-global`), but your terminal can't find the command, your `$PATH` is missing the npm bin folder. 
+>    - For **bash/zsh**: Run `echo 'export PATH=~/.npm-global/bin:$PATH' >> ~/.bashrc` and restart your terminal.
+>    - For **fish**: Run `fish_add_path $HOME/.npm-global/bin` and restart your terminal.
 
 Then edit `.env`.
 
