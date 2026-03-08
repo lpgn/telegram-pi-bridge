@@ -19,6 +19,7 @@ export const SYSTEMD_DIR = path.join(BASE_DIR, "systemd");
 export const SYSTEMD_LOCAL_FILE = path.join(SYSTEMD_DIR, "telegram-pi-bridge.service");
 export const SYSTEMD_TEMPLATE_FILE = path.join(SYSTEMD_DIR, "telegram-pi-bridge.service.example");
 export const PI_AUTH_FILE = path.join(os.homedir(), ".pi", "agent", "auth.json");
+export const SYSTEMD_UNIT = "telegram-pi-bridge.service";
 const execFileAsync = promisify(execFile);
 
 export async function ensureRuntimeDirs() {
@@ -48,16 +49,31 @@ export function isPidRunning(pid) {
 }
 
 export async function getStatus() {
-  let pid = await getPid();
-  let running = pid != null && isPidRunning(pid);
+  const systemd = await getPreferredSystemdService();
+  const processes = await listBridgeProcesses();
+  const bridgeNodes = processes.filter((processInfo) => processInfo.kind === "bridge-node");
 
-  if (!running) {
-    const discoveredPid = await findBridgePid();
-    if (discoveredPid) {
-      pid = discoveredPid;
-      running = true;
-      await ensureRuntimeDirs();
-      await writeFile(PID_FILE, `${pid}\n`, "utf8");
+  let pid = null;
+  let running = false;
+
+  const managedBridgePid = selectSystemdBridgePid(systemd, processes);
+  if (managedBridgePid && isPidRunning(managedBridgePid)) {
+    pid = managedBridgePid;
+    running = true;
+    await ensureRuntimeDirs();
+    await writeFile(PID_FILE, `${pid}\n`, "utf8");
+  } else {
+    pid = await getPid();
+    running = pid != null && isPidRunning(pid);
+
+    if (!running) {
+      const discoveredPid = bridgeNodes[0]?.pid ?? null;
+      if (discoveredPid) {
+        pid = discoveredPid;
+        running = true;
+        await ensureRuntimeDirs();
+        await writeFile(PID_FILE, `${pid}\n`, "utf8");
+      }
     }
   }
 
@@ -81,11 +97,41 @@ export async function getStatus() {
       mtimeMs: auditLogStat?.mtimeMs ?? 0,
     },
     env: envStatus,
+    supervisor: systemd.installed ? `systemd (${systemd.scope})` : "detached",
+    systemd,
+    bridgeProcessCount: bridgeNodes.length,
+    bridgePids: bridgeNodes.map((processInfo) => processInfo.pid),
+    duplicateBridgeProcesses: bridgeNodes.length > 1,
   };
 }
 
 export async function startBridge() {
   await ensureRuntimeDirs();
+  const systemd = await getPreferredSystemdService();
+  if (systemd.installed) {
+    if (systemd.active) {
+      const status = await getStatus();
+      return {
+        changed: false,
+        status,
+        message: status.duplicateBridgeProcesses
+          ? `Systemd service is already running, but duplicate bridge processes were detected (${status.bridgePids.join(", ")})`
+          : `Bridge already running via ${status.supervisor} (pid ${status.pid})`,
+      };
+    }
+
+    await controlSystemdService(systemd, "start");
+    await sleep(1200);
+    const status = await getStatus();
+    return {
+      changed: true,
+      status,
+      message: status.running
+        ? `Bridge started via ${status.supervisor} (pid ${status.pid})`
+        : `Systemd start requested, but bridge is not running; check ${OUT_LOG}`,
+    };
+  }
+
   const current = await getStatus();
   if (current.running) {
     return { changed: false, status: current, message: `Bridge already running (pid ${current.pid})` };
@@ -119,6 +165,27 @@ export async function startBridge() {
 }
 
 export async function stopBridge() {
+  await ensureRuntimeDirs();
+  const systemd = await getPreferredSystemdService();
+  if (systemd.installed) {
+    if (systemd.active) {
+      await controlSystemdService(systemd, "stop");
+    }
+    const cleanup = await killStrayBridgeProcesses();
+    await rm(PID_FILE, { force: true });
+    const status = await getStatus();
+    const details = cleanup.killed.length ? `; cleaned stray bridge pids ${cleanup.killed.join(", ")}` : "";
+    return {
+      changed: systemd.active || cleanup.killed.length > 0,
+      status,
+      message: systemd.active
+        ? `Bridge stopped via ${status.supervisor}${details}`
+        : cleanup.killed.length
+          ? `Systemd service was already stopped${details}`
+          : "Bridge is not running",
+    };
+  }
+
   const pid = await getPid();
   if (!pid || !isPidRunning(pid)) {
     await rm(PID_FILE, { force: true });
@@ -147,6 +214,26 @@ export async function stopBridge() {
 }
 
 export async function restartBridge() {
+  await ensureRuntimeDirs();
+  const systemd = await getPreferredSystemdService();
+  if (systemd.installed) {
+    if (systemd.active) {
+      await controlSystemdService(systemd, "stop");
+      await sleep(400);
+    }
+    const cleanup = await killStrayBridgeProcesses();
+    await rm(PID_FILE, { force: true });
+    await controlSystemdService(systemd, "start");
+    await sleep(1200);
+    const status = await getStatus();
+    const details = cleanup.killed.length ? `; cleaned stray bridge pids ${cleanup.killed.join(", ")}` : "";
+    return {
+      changed: true,
+      status,
+      message: `Bridge restarted via ${status.supervisor}${details}`,
+    };
+  }
+
   const stopped = await stopBridge();
   const started = await startBridge();
   return {
@@ -285,17 +372,17 @@ export async function writeSystemdService({ installPath, user }) {
 }
 
 export async function triggerLocalUnlock() {
-  const pid = await getPid();
-  if (!pid || !isPidRunning(pid)) {
+  const status = await getStatus();
+  if (!status.pid || !isPidRunning(status.pid)) {
     throw new Error("Bridge is not running");
   }
 
-  process.kill(pid, "SIGUSR1");
+  process.kill(status.pid, "SIGUSR1");
 
   const config = await getEffectiveConfig();
   const ttlMinutes = Math.max(1, Number(config.UNLOCK_TTL_MINUTES || 15));
   return {
-    pid,
+    pid: status.pid,
     ttlMinutes,
     unlockedUntil: Date.now() + ttlMinutes * 60_000,
   };
@@ -343,29 +430,156 @@ async function safeStat(target) {
   }
 }
 
-async function findBridgePid() {
+async function getPreferredSystemdService() {
+  const userService = await inspectSystemdService("user");
+  if (userService.installed) return userService;
+  return inspectSystemdService("system");
+}
+
+async function inspectSystemdService(scope) {
+  const args = scope === "user"
+    ? ["--user", "show", SYSTEMD_UNIT, "--property=LoadState,UnitFileState,ActiveState,SubState,FragmentPath,MainPID"]
+    : ["show", SYSTEMD_UNIT, "--property=LoadState,UnitFileState,ActiveState,SubState,FragmentPath,MainPID"];
+
   try {
-    const { stdout } = await execFileAsync("ps", ["-eo", "pid=,args="]);
+    const { stdout } = await execFileAsync("systemctl", args);
+    const fields = parseSystemctlShow(stdout);
+    const loadState = fields.LoadState || "not-found";
+    const fragmentPath = fields.FragmentPath || "";
+    const installed = loadState !== "not-found" || Boolean(fragmentPath);
+    const active = fields.ActiveState === "active";
+    const mainPid = Number(fields.MainPID) || 0;
+    return {
+      scope,
+      installed,
+      active,
+      unit: SYSTEMD_UNIT,
+      loadState,
+      unitFileState: fields.UnitFileState || "",
+      subState: fields.SubState || "",
+      fragmentPath,
+      mainPid,
+      controlHint: scope === "user" ? `systemctl --user <start|stop|restart> ${SYSTEMD_UNIT}` : `sudo systemctl <start|stop|restart> ${SYSTEMD_UNIT}`,
+    };
+  } catch {
+    return {
+      scope,
+      installed: false,
+      active: false,
+      unit: SYSTEMD_UNIT,
+      loadState: "unknown",
+      unitFileState: "",
+      subState: "",
+      fragmentPath: "",
+      mainPid: 0,
+      controlHint: scope === "user" ? `systemctl --user <start|stop|restart> ${SYSTEMD_UNIT}` : `sudo systemctl <start|stop|restart> ${SYSTEMD_UNIT}`,
+    };
+  }
+}
+
+function parseSystemctlShow(raw) {
+  const result = {};
+  for (const line of String(raw).split(/\r?\n/)) {
+    const index = line.indexOf("=");
+    if (index === -1) continue;
+    result[line.slice(0, index)] = line.slice(index + 1);
+  }
+  return result;
+}
+
+async function controlSystemdService(systemd, action) {
+  const args = systemd.scope === "user"
+    ? ["--user", action, SYSTEMD_UNIT]
+    : [action, SYSTEMD_UNIT];
+
+  try {
+    await execFileAsync("systemctl", args);
+  } catch (error) {
+    const details = [error?.stderr, error?.stdout, error?.message].filter(Boolean).join(" ").trim();
+    throw new Error(
+      `Could not ${action} ${SYSTEMD_UNIT} via systemd (${systemd.scope}). ${details || "systemctl failed"}. Try: ${systemd.controlHint}`
+    );
+  }
+}
+
+async function listBridgeProcesses() {
+  try {
+    const { stdout } = await execFileAsync("ps", ["-eo", "pid=,ppid=,args="]);
     const lines = stdout.split("\n");
-    let fallbackPid = null;
+    const processes = [];
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      const match = trimmed.match(/^(\d+)\s+(.*)$/);
+      const match = trimmed.match(/^(\d+)\s+(\d+)\s+(.*)$/);
       if (!match) continue;
-      const [, pidText, args] = match;
+      const [, pidText, ppidText, args] = match;
       const pid = Number(pidText);
+      const ppid = Number(ppidText);
       if (!Number.isFinite(pid) || pid === process.pid || !isPidRunning(pid)) continue;
 
-      if (args.includes(ENTRYPOINT) || args.includes("node src/index.mjs")) {
-        if (!args.includes("sh -c node src/index.mjs")) return pid;
-        fallbackPid = fallbackPid ?? pid;
+      let kind = null;
+      if (args.includes("sh -c node src/index.mjs")) {
+        kind = "bridge-shell";
+      } else if (args.includes(ENTRYPOINT) || args.includes("node src/index.mjs")) {
+        kind = "bridge-node";
       }
+
+      if (!kind) continue;
+      processes.push({ pid, ppid, args, kind });
     }
-    return fallbackPid;
+    return processes;
   } catch {
-    return null;
+    return [];
   }
+}
+
+async function killStrayBridgeProcesses() {
+  const processes = await listBridgeProcesses();
+  const targets = processes.filter((processInfo) => processInfo.pid !== process.pid);
+  const killed = [];
+
+  for (const processInfo of [...targets].sort((a, b) => b.pid - a.pid)) {
+    try {
+      process.kill(processInfo.pid, "SIGTERM");
+      killed.push(processInfo.pid);
+    } catch {
+      // ignore
+    }
+  }
+
+  for (const pid of killed) {
+    if (!(await waitForExit(pid, 2500))) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // ignore
+      }
+      await waitForExit(pid, 1500);
+    }
+  }
+
+  return { killed };
+}
+
+function selectSystemdBridgePid(systemd, processes) {
+  if (!systemd.installed || systemd.mainPid <= 0) return null;
+
+  const byPid = new Map(processes.map((processInfo) => [processInfo.pid, processInfo]));
+  const bridgeNodes = processes.filter((processInfo) => processInfo.kind === "bridge-node");
+
+  for (const processInfo of bridgeNodes) {
+    let currentPid = processInfo.pid;
+    const seen = new Set();
+    while (Number.isFinite(currentPid) && currentPid > 0 && !seen.has(currentPid)) {
+      seen.add(currentPid);
+      if (currentPid === systemd.mainPid) return processInfo.pid;
+      const current = byPid.get(currentPid);
+      if (!current) break;
+      currentPid = current.ppid;
+    }
+  }
+
+  return isPidRunning(systemd.mainPid) ? systemd.mainPid : null;
 }
 
 async function waitForExit(pid, timeoutMs) {

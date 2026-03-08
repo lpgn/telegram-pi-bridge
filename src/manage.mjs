@@ -42,6 +42,13 @@ async function printResult(result) {
 function printStatus(status) {
   console.log(`running: ${status.running ? "yes" : "no"}`);
   console.log(`pid: ${status.pid ?? "-"}`);
+  console.log(`supervisor: ${status.supervisor || "detached"}`);
+  if (status.systemd?.installed) {
+    console.log(`systemd unit: ${status.systemd.fragmentPath || status.systemd.unit}`);
+  }
+  if (status.duplicateBridgeProcesses) {
+    console.log(`warning: duplicate bridge pids detected (${status.bridgePids.join(", ")})`);
+  }
   console.log(`bridge log: ${status.outLog.path} (${status.outLog.size} bytes)`);
   console.log(`audit log: ${status.auditLog.path} (${status.auditLog.size} bytes)`);
 }

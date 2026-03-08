@@ -321,6 +321,7 @@ function renderStatus(status) {
   const lines = [
     `{bold}Bridge:{/bold} ${status.running ? "{green-fg}RUNNING{/green-fg}" : "{red-fg}STOPPED{/red-fg}"}`,
     `{bold}PID:{/bold} ${status.pid ?? "-"}`,
+    `{bold}Supervisor:{/bold} ${status.supervisor || "detached"}`,
     `{bold}Config:{/bold} ${envLine}`,
     `{bold}.env:{/bold} ${ENV_FILE}`,
     `{bold}Local service:{/bold} ${SYSTEMD_LOCAL_FILE}`,
@@ -328,6 +329,14 @@ function renderStatus(status) {
     `{bold}Bridge log:{/bold} ${status.outLog.path} (${formatBytes(status.outLog.size)})`,
     `{bold}Audit log:{/bold} ${status.auditLog.path} (${formatBytes(status.auditLog.size)})`,
   ];
+
+  if (status.systemd?.installed) {
+    lines.splice(4, 0, `{bold}Systemd unit:{/bold} ${status.systemd.fragmentPath || status.systemd.unit}`);
+  }
+
+  if (status.duplicateBridgeProcesses) {
+    lines.push(`{yellow-fg}Warning:{/yellow-fg} duplicate bridge pids detected (${status.bridgePids.join(", ")})`);
+  }
   statusBox.setContent(lines.join("\n"));
 }
 
@@ -401,6 +410,19 @@ async function renderBridgeSummary() {
     "",
     `Running: ${status.running ? "yes" : "no"}`,
     `PID: ${status.pid ?? "-"}`,
+    `Supervisor: ${status.supervisor || "detached"}`,
+    ...(status.systemd?.installed
+      ? [
+          `Systemd unit: ${status.systemd.fragmentPath || status.systemd.unit}`,
+          `Systemd control: ${status.systemd.controlHint}`,
+        ]
+      : ["Process control: built-in detached launcher"]),
+    ...(status.duplicateBridgeProcesses
+      ? [
+          `Duplicate bridge pids detected: ${status.bridgePids.join(", ")}`,
+          "Restart from this menu will stop the systemd unit, clean stray processes, and start one fresh instance.",
+        ]
+      : []),
     `Bridge log: ${status.outLog.path}`,
     `Audit log: ${status.auditLog.path}`,
     "",
@@ -416,7 +438,9 @@ async function renderBridgeSummary() {
     "Local TUI-only action:",
     "- Temporarily unlock from local TUI",
     "",
-    "Note: restarting here restarts the Telegram bridge process, not this TUI.",
+    status.systemd?.installed
+      ? "Note: process controls here delegate to systemd when a service is installed."
+      : "Note: restarting here restarts the Telegram bridge process, not this TUI.",
   ].join("\n");
 }
 
