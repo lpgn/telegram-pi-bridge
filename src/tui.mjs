@@ -19,6 +19,7 @@ import {
   startBridge,
   stopBridge,
   testConfiguration,
+  triggerLocalUnlock,
   writeEnvConfig,
   writeSystemdService,
 } from "./manager-lib.mjs";
@@ -44,7 +45,15 @@ const MENUS = {
   },
   bridge: {
     title: " Bridge ",
-    items: ["Status", "Start bridge", "Stop bridge", "Restart bridge", "Back"],
+    items: [
+      "Status",
+      "Start Telegram bridge process",
+      "Stop Telegram bridge process",
+      "Restart Telegram bridge process",
+      "Temporarily unlock from local TUI",
+      "Show Telegram command reference",
+      "Back",
+    ],
   },
   logs: {
     title: " Logs ",
@@ -221,18 +230,24 @@ async function runAction(section, item) {
         setMessage("Bridge status refreshed");
         outputBox.setLabel(" Details ");
         outputBox.setContent(await renderBridgeSummary());
-      } else if (item === "Start bridge") {
+      } else if (item === "Start Telegram bridge process") {
         setMessage((await startBridge()).message);
         outputBox.setLabel(" Details ");
         outputBox.setContent(await renderBridgeSummary());
-      } else if (item === "Stop bridge") {
+      } else if (item === "Stop Telegram bridge process") {
         setMessage((await stopBridge()).message);
         outputBox.setLabel(" Details ");
         outputBox.setContent(await renderBridgeSummary());
-      } else if (item === "Restart bridge") {
+      } else if (item === "Restart Telegram bridge process") {
         setMessage((await restartBridge()).message);
         outputBox.setLabel(" Details ");
         outputBox.setContent(await renderBridgeSummary());
+      } else if (item === "Temporarily unlock from local TUI") {
+        await runLocalUnlock();
+      } else if (item === "Show Telegram command reference") {
+        setMessage("Showing Telegram command reference");
+        outputBox.setLabel(" Telegram Commands ");
+        outputBox.setContent(renderTelegramCommandReference());
       }
     } else if (section === "logs") {
       if (item === "Show bridge log") {
@@ -378,9 +393,11 @@ async function renderBridgeSummary() {
   return [
     "Bridge controls:",
     "- Status",
-    "- Start bridge",
-    "- Stop bridge",
-    "- Restart bridge",
+    "- Start Telegram bridge process",
+    "- Stop Telegram bridge process",
+    "- Restart Telegram bridge process",
+    "- Temporarily unlock from local TUI",
+    "- Show Telegram command reference",
     "",
     `Running: ${status.running ? "yes" : "no"}`,
     `PID: ${status.pid ?? "-"}`,
@@ -392,8 +409,76 @@ async function renderBridgeSummary() {
       : "Configuration checks look good.",
     ...warnings.slice(0, 5).map((warning) => `- ${warning.name}: ${warning.details}`),
     "",
-    "Tip: open Logs to watch runtime output.",
+    "Telegram commands available to the bot:",
+    "- /help, /status, /unlock, /lock, /clear",
+    "- /new, /session, /compact, /name, /resume",
+    "",
+    "Local TUI-only action:",
+    "- Temporarily unlock from local TUI",
+    "",
+    "Note: restarting here restarts the Telegram bridge process, not this TUI.",
   ].join("\n");
+}
+
+function renderTelegramCommandReference() {
+  return [
+    "Telegram command reference",
+    "",
+    "Core:",
+    "- /help — show available commands",
+    "- /status — show lock state",
+    "- /unlock <code> — unlock temporarily",
+    "- /lock — lock immediately",
+    "- /clear — wipe this chat's saved session history",
+    "",
+    "Session management:",
+    "- /new — start a fresh session for this chat",
+    "- /session — show current session details",
+    "- /compact [instructions] — compact long session context",
+    "- /name <label> — name the current session",
+    "- /resume — list saved sessions for this chat",
+    "- /resume <n> — reopen one of those sessions",
+    "",
+    "Local TUI-only action:",
+    "- Temporarily unlock from local TUI — signals the running bridge process to unlock locally",
+    "",
+    "Notes:",
+    "- normal text prompts go to pi only while unlocked",
+    "- these commands are used from Telegram, not from inside this TUI",
+    "- this TUI manages the local bridge process and configuration",
+  ].join("\n");
+}
+
+async function runLocalUnlock() {
+  const config = await getEffectiveConfig();
+  const ttlMinutes = normalizePositiveInt(config.UNLOCK_TTL_MINUTES || "15", 15);
+
+  const confirmed = await askYesNo([
+    "Temporarily unlock bridge from local TUI?",
+    "",
+    "This bypasses Telegram /unlock code entry.",
+    "That is usually acceptable if local shell/TUI access is already trusted.",
+    "If an untrusted person can launch this TUI, your problem is already larger than TOTP.",
+    "",
+    `Configured unlock TTL: ${ttlMinutes} minutes`,
+    "This uses a local-only signal to the running bridge process.",
+    "No restart needed.",
+  ].join("\n"), true);
+  if (!confirmed) return cancel();
+
+  const result = await triggerLocalUnlock();
+  setMessage(`Unlocked locally until ${new Date(result.unlockedUntil).toISOString()}`);
+  outputBox.setLabel(" Details ");
+  outputBox.setContent([
+    "Local TUI unlock applied.",
+    "",
+    `Bridge PID: ${result.pid}`,
+    `TTL: ${result.ttlMinutes} minutes`,
+    `Unlocked until: ${new Date(result.unlockedUntil).toISOString()}`,
+    "",
+    "This action is local-only and is not available from Telegram.",
+    "No bridge restart was performed.",
+  ].join("\n"));
 }
 
 function renderHelp() {

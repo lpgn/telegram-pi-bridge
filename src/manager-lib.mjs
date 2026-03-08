@@ -229,6 +229,7 @@ export async function getEffectiveConfig() {
     UNLOCK_TOTP_SECRET: env.UNLOCK_TOTP_SECRET || "",
     UNLOCK_SHARED_SECRET: env.UNLOCK_SHARED_SECRET || "",
     UNLOCK_TTL_MINUTES: env.UNLOCK_TTL_MINUTES || "15",
+    UNLOCK_STATE_FILE: env.UNLOCK_STATE_FILE || path.join(BASE_DIR, "data", "unlock-state.json"),
     ALERT_OWNER_ON_DENIED: env.ALERT_OWNER_ON_DENIED || "true",
     AUDIT_LOG_FILE: env.AUDIT_LOG_FILE || AUDIT_LOG,
     MAX_TEXT_LENGTH: env.MAX_TEXT_LENGTH || "12000",
@@ -259,6 +260,7 @@ export async function writeEnvConfig(config) {
 
   lines.push(
     `UNLOCK_TTL_MINUTES=${config.UNLOCK_TTL_MINUTES}`,
+    config.UNLOCK_STATE_FILE ? `UNLOCK_STATE_FILE=${config.UNLOCK_STATE_FILE}` : `# UNLOCK_STATE_FILE=${path.join(BASE_DIR, "data", "unlock-state.json")}`,
     `ALERT_OWNER_ON_DENIED=${config.ALERT_OWNER_ON_DENIED}`,
     `AUDIT_LOG_FILE=${config.AUDIT_LOG_FILE || AUDIT_LOG}`,
     `MAX_TEXT_LENGTH=${config.MAX_TEXT_LENGTH}`,
@@ -280,6 +282,23 @@ export async function writeSystemdService({ installPath, user }) {
   await mkdir(SYSTEMD_DIR, { recursive: true });
   await writeFile(SYSTEMD_LOCAL_FILE, content, "utf8");
   return { path: SYSTEMD_LOCAL_FILE, content };
+}
+
+export async function triggerLocalUnlock() {
+  const pid = await getPid();
+  if (!pid || !isPidRunning(pid)) {
+    throw new Error("Bridge is not running");
+  }
+
+  process.kill(pid, "SIGUSR1");
+
+  const config = await getEffectiveConfig();
+  const ttlMinutes = Math.max(1, Number(config.UNLOCK_TTL_MINUTES || 15));
+  return {
+    pid,
+    ttlMinutes,
+    unlockedUntil: Date.now() + ttlMinutes * 60_000,
+  };
 }
 
 export function renderSystemdService({ workingDirectory, user }) {

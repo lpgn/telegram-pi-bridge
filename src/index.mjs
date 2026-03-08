@@ -99,9 +99,7 @@ class PiSessionPool {
   }
 
   async newSession(chatId) {
-    const session = await this.get(chatId);
-    await session.newSession();
-    return session;
+    return this.replace(chatId, SessionManager.create(this.workspaceDir, this.getSessionDir(chatId)));
   }
 
   async list(chatId) {
@@ -310,17 +308,37 @@ bot.command("resume", async (ctx) => {
     }
 
     const index = Number(arg);
-    if (!Number.isInteger(index) || index < 1 || index > sessions.length) {
-      await audit("RESUME_BAD_INDEX", ctx, { arg, count: sessions.length });
-      await ctx.reply(`Pick a number between 1 and ${sessions.length}. Use /resume to list sessions.`);
-      return;
+    let selected;
+    let selectedIndex = null;
+
+    if (Number.isInteger(index) && index >= 1 && index <= sessions.length) {
+      selectedIndex = index;
+      selected = sessions[index - 1];
+    } else {
+      const matches = sessions.filter((entry) => {
+        const name = String(entry.name || "").trim().toLowerCase();
+        const query = arg.trim().toLowerCase();
+        return name && (name === query || name.startsWith(query));
+      });
+
+      if (matches.length === 1) {
+        selected = matches[0];
+        selectedIndex = sessions.findIndex((entry) => entry.path === selected.path) + 1;
+      } else if (matches.length > 1) {
+        await audit("RESUME_AMBIGUOUS_NAME", ctx, { arg, matches: matches.length });
+        await ctx.reply(`More than one session matches '${arg}'. Use /resume to list them, then choose a number.`);
+        return;
+      } else {
+        await audit("RESUME_BAD_TARGET", ctx, { arg, count: sessions.length });
+        await ctx.reply(`No session matched '${arg}'. Use /resume to list sessions, then pick a number or exact name.`);
+        return;
+      }
     }
 
-    const selected = sessions[index - 1];
     const session = await sessionPool.resume(ctx.chat.id, selected.path);
-    await audit("RESUME_OPEN", ctx, { index, sessionId: session.sessionId, sessionFile: session.sessionFile });
+    await audit("RESUME_OPEN", ctx, { index: selectedIndex, sessionId: session.sessionId, sessionFile: session.sessionFile });
     await ctx.reply([
-      `Resumed session ${index}.`,
+      `Resumed session ${selectedIndex}.`,
       `Name: ${selected.name || "(unnamed)"}`,
       `Updated: ${selected.modified.toISOString()}`,
       `First message: ${safePreview(selected.firstMessage || "") || "(empty)"}`,
@@ -399,6 +417,16 @@ let shuttingDown = false;
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+process.on("SIGUSR1", () => {
+  unlockFromLocalTui().catch((error) => {
+    console.error("Local TUI unlock failed:", error);
+    appendAuditLine({
+      time: new Date().toISOString(),
+      event: "LOCAL_UNLOCK_ERROR",
+      error: error?.message || String(error),
+    }).catch(() => {});
+  });
+});
 
 const me = await bot.api.getMe();
 console.log(`Starting Telegram pi bridge as @${me.username}`);
@@ -428,6 +456,19 @@ async function shutdown() {
   await appendAuditLine({ time: new Date().toISOString(), event: "SHUTDOWN" });
   await sessionPool.disposeAll();
   process.exit(0);
+}
+
+async function unlockFromLocalTui() {
+  unlockState.unlockedUntil = Date.now() + UNLOCK_TTL_MINUTES * 60_000;
+  unlockState.unlockedBy = "tui-local";
+  await saveUnlockState();
+  console.log(`Local TUI unlock granted until ${new Date(unlockState.unlockedUntil).toISOString()}`);
+  await appendAuditLine({
+    time: new Date().toISOString(),
+    event: "LOCAL_UNLOCK",
+    unlockedUntil: new Date(unlockState.unlockedUntil).toISOString(),
+    unlockedBy: unlockState.unlockedBy,
+  });
 }
 
 async function startBotWithRetry() {
@@ -691,7 +732,7 @@ function helpText() {
     "/compact [instructions] — compact long session context",
     "/name <label> — name the current session",
     "/resume — list saved sessions for this chat",
-    "/resume <n> — reopen one of those sessions",
+    "/resume <n|name> — reopen one of those sessions",
     "/help — show this help",
     "",
     "Normal text prompts are forwarded to pi only while unlocked.",
@@ -721,7 +762,7 @@ function formatResumeList(sessions) {
   if (sessions.length > 12) {
     lines.push(`…and ${sessions.length - 12} more. Use a smaller habit, or I can add pagination later.`);
   }
-  lines.push("", "Use /resume <number> to reopen one.");
+  lines.push("", "Use /resume <number> or /resume <name> to reopen one.");
   return lines.join("\n");
 }
 
