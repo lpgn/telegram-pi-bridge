@@ -112,6 +112,8 @@ cd ~/telepi
 cp "$(npm root -g)/@lpgn/telepi/.env.example" .env
 ```
 
+> **Note:** If you get an `EACCES` permission error during the global install, it means your node environment needs `sudo` (e.g. `sudo npm install -g @lpgn/telepi`), or you should configure npm to use a user-owned directory for global packages (like using `nvm`).
+
 Then edit `.env`.
 
 By default, the global `telepi` installation uses your current working directory for `.env`, `data/`, `logs/`, `run/`, and generated `systemd/` files.
