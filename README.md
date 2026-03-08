@@ -6,7 +6,7 @@ License: [MIT](./LICENSE)
 
 ## What this is
 
-This repo is a **single-owner remote admin bridge** for talking to **pi** from the comfort of a Telegram chat.
+This repo is a **single-owner remote admin bridge** for talking to **pi** through Telegram.
 
 That is the whole trick:
 
@@ -20,7 +20,7 @@ No giant platform. No orchestration theme park. No "AI operating system for syne
 
 - not a SaaS
 - not a multi-user chat platform
-- not an enterprise product suitable for corporate compliance
+- not an enterprise product
 - not guaranteed to be a good idea
 
 ## Vibe-coded disclaimer
@@ -31,7 +31,7 @@ Which means:
 
 - it works for me
 - it may work for you
-- it may also become a tiny goblin at a highly inconvenient time
+- it may also become a tiny goblin at an inconvenient time
 
 There is **no warranty** and **no promise of fitness for any purpose**.
 Please review the code, restrict the workspace, and do not point this at anything you cannot afford to have deleted by a hallucinating LLM.
@@ -43,8 +43,8 @@ This bridge depends on **pi** and uses the **pi SDK**.
 - pi repo: https://github.com/badlogic/pi-mono
 - npm package: https://www.npmjs.com/package/@mariozechner/pi-coding-agent
 
-You need pi installed, configured, and authenticated independently.
-This bridge does **not** replace pi. It simply hands pi a Telegram megaphone.
+You need pi installed, configured, and authenticated separately.
+This bridge does **not** replace pi. It just gives pi a Telegram handle.
 
 Examples:
 
@@ -120,7 +120,7 @@ If you want to keep those files somewhere specific regardless of where you are w
 ### Option B: Run from source (The hacker way)
 
 ```bash
-git clone https://github.com/yourname/telegram-pi-bridge.git telepi
+git clone https://github.com/lpgn/telepi.git telepi
 cd telepi
 npm install
 cp .env.example .env
@@ -339,6 +339,6 @@ This project is small on purpose. That is a feature.
 If you wanted a massive AI enterprise workflow orchestrator platform, this is emphatically not that.
 If you wanted a compact Telegram-to-pi bridge with a few sensible security rails and a genuinely delightful manager TUI, that is exactly what this is.
 
-Use it, fork it, improve it, or laugh at its simplicity.
+Use it, fork it, improve it, or laugh at it.
 But please do so responsibly.
 
