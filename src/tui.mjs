@@ -1,7 +1,8 @@
 import blessed from "blessed";
-import crypto from "node:crypto";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import os from "node:os";
 import QRCode from "qrcode";
+import { generateSharedSecret, generateTotpSecret } from "./totp.mjs";
 import {
   AUDIT_LOG,
   ENV_FILE,
@@ -750,7 +751,10 @@ async function exportTotpQr() {
   const pngPath = `${SHARE_DIR}/totp-qr.png`;
   const txtPath = `${SHARE_DIR}/totp-uri.txt`;
   await QRCode.toFile(pngPath, uri, { type: "png", width: 512, margin: 2 });
-  await import("node:fs/promises").then((fs) => fs.writeFile(txtPath, `${uri}\n`, "utf8"));
+  await writeFile(txtPath, `${uri}\n`, { encoding: "utf8", mode: 0o600 });
+  // Both files embed the TOTP secret; never leave them world-readable.
+  await chmod(pngPath, 0o600);
+  await chmod(txtPath, 0o600);
   setMessage(`Exported TOTP QR to ${pngPath}`);
   outputBox.setLabel(" Details ");
   outputBox.setContent([`QR image: ${pngPath}`, `OTP URI: ${txtPath}`, "", uri].join("\n"));
@@ -934,23 +938,6 @@ async function askYesNo(message, defaultYes = true) {
   });
 }
 
-function generateSharedSecret() {
-  return crypto.randomBytes(24).toString("hex");
-}
-
-function generateTotpSecret() {
-  return toBase32(crypto.randomBytes(20));
-}
-
-function toBase32(buffer) {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-  let bits = "";
-  for (const byte of buffer) bits += byte.toString(2).padStart(8, "0");
-  let output = "";
-  for (let i = 0; i < bits.length; i += 5) output += alphabet[Number.parseInt(bits.slice(i, i + 5).padEnd(5, "0"), 2)];
-  return output;
-}
-
 function maskValue(value) {
   const text = String(value || "");
   if (text.length <= 8) return "*".repeat(text.length);
@@ -977,7 +964,7 @@ function cancel() {
 }
 
 async function ensureShareDir() {
-  await import("node:fs/promises").then((fs) => fs.mkdir(SHARE_DIR, { recursive: true }));
+  await mkdir(SHARE_DIR, { recursive: true });
 }
 
 function shutdown() {

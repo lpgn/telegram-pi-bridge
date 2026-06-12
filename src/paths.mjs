@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,13 +23,22 @@ function resolveAppDir() {
   if (override) return path.resolve(expandHome(override));
 
   const cwd = process.cwd();
-  if (
-    existsSync(path.join(cwd, ".env")) ||
-    existsSync(path.join(cwd, ".env.example")) ||
-    existsSync(path.join(cwd, "package.json"))
-  ) {
-    return cwd;
-  }
+  if (looksLikeTelepiDir(cwd)) return cwd;
 
   return PACKAGE_DIR;
+}
+
+// Only adopt the cwd as the app dir when its env file is actually a telepi
+// config; matching on package.json alone would hijack any Node project.
+function looksLikeTelepiDir(dir) {
+  for (const name of [".env", ".env.example"]) {
+    const file = path.join(dir, name);
+    if (!existsSync(file)) continue;
+    try {
+      if (readFileSync(file, "utf8").includes("TELEGRAM_BOT_TOKEN")) return true;
+    } catch {
+      // Unreadable env file; keep looking.
+    }
+  }
+  return false;
 }

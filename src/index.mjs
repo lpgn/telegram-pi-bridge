@@ -1,17 +1,16 @@
-import { appendFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import crypto from "node:crypto";
+import { mkdir } from "node:fs/promises";
 import path from "node:path";
 
 import dotenv from "dotenv";
 import { Bot } from "grammy";
 import { getModel } from "@mariozechner/pi-ai";
-import {
-  AuthStorage,
-  createAgentSession,
-  ModelRegistry,
-  SessionManager,
-} from "@mariozechner/pi-coding-agent";
+import { AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
+
 import { APP_DIR, DATA_DIR, LOGS_DIR, SESSIONS_DIR, expandHome, sleep } from "./paths.mjs";
+import { createAuditLogger, tightenLogPermissions } from "./audit.mjs";
+import { PiSessionPool } from "./session-pool.mjs";
+import { commandArgs, parseBoolean, safePreview, splitForTelegram } from "./telegram-format.mjs";
+import { UnlockManager } from "./unlock.mjs";
 
 dotenv.config({ path: path.join(APP_DIR, ".env") });
 const UNLOCK_STATE_FILE = process.env.UNLOCK_STATE_FILE?.trim() || path.join(DATA_DIR, "unlock-state.json");
@@ -21,11 +20,12 @@ const OWNER_CHAT_ID = optionalNumericEnv("OWNER_CHAT_ID");
 const PI_WORKSPACE_DIR = path.resolve(process.env.PI_WORKSPACE_DIR || process.cwd());
 const PI_AGENT_DIR = expandHome(process.env.PI_AGENT_DIR || "~/.pi/agent");
 const PI_THINKING_LEVEL = process.env.PI_THINKING_LEVEL || undefined;
-const TELEGRAM_MAX_MESSAGE = 4000;
 const TYPING_INTERVAL_MS = 4000;
 const ALLOW_PRIVATE_CHATS_ONLY = parseBoolean(process.env.ALLOW_PRIVATE_CHATS_ONLY, true);
 const UNLOCK_METHOD = (process.env.UNLOCK_METHOD || "totp").trim().toLowerCase();
 const UNLOCK_TTL_MINUTES = Math.max(1, Number(process.env.UNLOCK_TTL_MINUTES || 15));
+const UNLOCK_MAX_FAILURES = Math.max(1, Number(process.env.UNLOCK_MAX_FAILURES || 5));
+const UNLOCK_LOCKOUT_MINUTES = Math.max(1, Number(process.env.UNLOCK_LOCKOUT_MINUTES || 15));
 const ALERT_OWNER_ON_DENIED = parseBoolean(process.env.ALERT_OWNER_ON_DENIED, true);
 const AUDIT_LOG_FILE = process.env.AUDIT_LOG_FILE?.trim() || path.join(LOGS_DIR, "audit.log");
 const MAX_TEXT_LENGTH = Math.max(1, Number(process.env.MAX_TEXT_LENGTH || 12000));
@@ -42,120 +42,32 @@ const authStorage = AuthStorage.create();
 const modelRegistry = new ModelRegistry(authStorage);
 const fixedModel = resolveModelFromEnv();
 
-class PiSessionPool {
-  constructor({ workspaceDir, agentDir, thinkingLevel, model }) {
-    this.workspaceDir = workspaceDir;
-    this.agentDir = agentDir;
-    this.thinkingLevel = thinkingLevel;
-    this.model = model;
-    this.sessions = new Map();
-  }
-
-  getSessionDir(chatId) {
-    return path.join(SESSIONS_DIR, String(chatId));
-  }
-
-  async create(chatId, sessionManager) {
-    const sessionDir = this.getSessionDir(chatId);
-    await mkdir(sessionDir, { recursive: true });
-
-    return createAgentSession({
-      cwd: this.workspaceDir,
-      agentDir: this.agentDir,
-      authStorage,
-      modelRegistry,
-      model: this.model,
-      thinkingLevel: this.thinkingLevel,
-      sessionManager,
-    }).then(({ session, modelFallbackMessage }) => {
-      if (modelFallbackMessage) {
-        console.warn(`[chat ${chatId}] ${modelFallbackMessage}`);
-      }
-      return session;
-    });
-  }
-
-  async get(chatId) {
-    const key = String(chatId);
-    if (this.sessions.has(key)) return this.sessions.get(key);
-
-    const entry = this.create(chatId, SessionManager.continueRecent(this.workspaceDir, this.getSessionDir(chatId)));
-    this.sessions.set(key, entry);
-    return entry;
-  }
-
-  async replace(chatId, sessionManager) {
-    const key = String(chatId);
-    await this.dispose(chatId);
-    const entry = this.create(chatId, sessionManager);
-    this.sessions.set(key, entry);
-    return entry;
-  }
-
-  async newSession(chatId) {
-    return this.replace(chatId, SessionManager.create(this.workspaceDir, this.getSessionDir(chatId)));
-  }
-
-  async list(chatId) {
-    const sessionDir = this.getSessionDir(chatId);
-    await mkdir(sessionDir, { recursive: true });
-    return SessionManager.list(this.workspaceDir, sessionDir);
-  }
-
-  async resume(chatId, sessionPath) {
-    return this.replace(chatId, SessionManager.open(sessionPath, this.getSessionDir(chatId)));
-  }
-
-  async dispose(chatId) {
-    const key = String(chatId);
-    const existing = this.sessions.get(key);
-    if (existing) {
-      try {
-        const session = await existing;
-        session.dispose();
-      } catch {
-        // Ignore broken session during dispose.
-      }
-      this.sessions.delete(key);
-    }
-  }
-
-  async clear(chatId) {
-    await this.dispose(chatId);
-    await rm(this.getSessionDir(chatId), { recursive: true, force: true });
-  }
-
-  async disposeAll() {
-    const entries = [...this.sessions.values()];
-    this.sessions.clear();
-    for (const entry of entries) {
-      try {
-        (await entry).dispose();
-      } catch {
-        // Ignore dispose failures.
-      }
-    }
-  }
-}
-
 const sessionPool = new PiSessionPool({
   workspaceDir: PI_WORKSPACE_DIR,
   agentDir: PI_AGENT_DIR,
   thinkingLevel: PI_THINKING_LEVEL,
   model: fixedModel,
+  sessionsDir: SESSIONS_DIR,
+  authStorage,
+  modelRegistry,
 });
 const bot = new Bot(TELEGRAM_BOT_TOKEN);
 const chatLocks = new Map();
 const recentAlerts = new Map();
-const unlockState = {
-  unlockedUntil: 0,
-  unlockedBy: null,
-};
+const unlockManager = new UnlockManager({
+  stateFile: UNLOCK_STATE_FILE,
+  ttlMinutes: UNLOCK_TTL_MINUTES,
+  method: UNLOCK_METHOD,
+  totpSecret: TOTP_SECRET,
+  sharedSecret: SHARED_SECRET,
+  maxFailures: UNLOCK_MAX_FAILURES,
+  lockoutMinutes: UNLOCK_LOCKOUT_MINUTES,
+});
+const appendAuditLine = createAuditLogger(AUDIT_LOG_FILE);
 
 await mkdir(SESSIONS_DIR, { recursive: true });
-await mkdir(path.dirname(AUDIT_LOG_FILE), { recursive: true });
-await mkdir(path.dirname(UNLOCK_STATE_FILE), { recursive: true });
-await loadUnlockState();
+await tightenLogPermissions(AUDIT_LOG_FILE);
+await unlockManager.load();
 
 bot.use(async (ctx, next) => {
   const decision = await authorize(ctx);
@@ -164,11 +76,11 @@ bot.use(async (ctx, next) => {
 });
 
 bot.command("start", async (ctx) => {
-  await audit("START", ctx, { locked: isLocked() });
+  await audit("START", ctx, { locked: unlockManager.isLocked() });
   await ctx.reply(
     [
       "Remote admin bridge is ready.",
-      `State: ${isLocked() ? "locked" : `unlocked until ${new Date(unlockState.unlockedUntil).toISOString()}`}`,
+      `State: ${lockStateText()}`,
       "Use /help to see commands.",
     ].join("\n")
   );
@@ -180,43 +92,70 @@ bot.command("help", async (ctx) => {
 });
 
 bot.command("status", async (ctx) => {
-  await audit("STATUS", ctx, { locked: isLocked() });
-  await ctx.reply(
-    isLocked()
-      ? "Status: locked"
-      : `Status: unlocked until ${new Date(unlockState.unlockedUntil).toISOString()}`
-  );
+  await audit("STATUS", ctx, { locked: unlockManager.isLocked() });
+  const lines = [`Status: ${lockStateText()}`];
+  if (unlockManager.isLockedOut()) {
+    lines.push(`Unlock disabled for ${formatMinutes(unlockManager.lockoutRemainingMs())} after repeated failures.`);
+  }
+  await ctx.reply(lines.join("\n"));
 });
 
 bot.command("unlock", async (ctx) => {
   const code = commandArgs(ctx.message?.text);
-  const success = verifyUnlockCode(code);
+  // Remove the message so the code does not linger in chat history.
+  if (ctx.message?.message_id) {
+    ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
+  }
 
-  if (!success) {
-    await audit("UNLOCK_FAILURE", ctx, {});
-    await alertOwner(
-      `Failed unlock attempt from owner account. chat_id=${ctx.chat.id} time=${new Date().toISOString()}`,
-      "unlock-failure"
-    );
-    await ctx.reply("Unlock failed.");
+  if (!code) {
+    await audit("UNLOCK_MISSING_CODE", ctx, {});
+    await ctx.reply("Usage: /unlock <code>");
     return;
   }
 
-  unlockState.unlockedUntil = Date.now() + UNLOCK_TTL_MINUTES * 60_000;
-  unlockState.unlockedBy = ctx.from?.id ?? null;
-  await saveUnlockState();
-  await audit("UNLOCK_SUCCESS", ctx, { unlockedUntil: new Date(unlockState.unlockedUntil).toISOString() });
-  await ctx.reply(`Unlocked for ${UNLOCK_TTL_MINUTES} minutes.`);
+  const result = await unlockManager.attemptUnlock(code, ctx.from?.id ?? null);
+
+  if (result.ok) {
+    await audit("UNLOCK_SUCCESS", ctx, {
+      textPreview: "/unlock <redacted>",
+      unlockedUntil: new Date(result.unlockedUntil).toISOString(),
+    });
+    await ctx.reply(`Unlocked for ${UNLOCK_TTL_MINUTES} minutes.`);
+    return;
+  }
+
+  if (result.reason === "locked-out") {
+    await audit("UNLOCK_DENIED_LOCKOUT", ctx, { retryAfterMs: result.retryAfterMs });
+    await ctx.reply(`Unlock is temporarily disabled after repeated failures. Try again in ${formatMinutes(result.retryAfterMs)}.`);
+    return;
+  }
+
+  if (result.reason === "lockout-started") {
+    await audit("UNLOCK_LOCKOUT_STARTED", ctx, { retryAfterMs: result.retryAfterMs });
+    await alertOwner(
+      `Unlock locked out after ${UNLOCK_MAX_FAILURES} failed attempts. chat_id=${ctx.chat.id} time=${new Date().toISOString()}`,
+      "unlock-lockout"
+    );
+    await ctx.reply(`Unlock failed. Too many attempts — unlock disabled for ${UNLOCK_LOCKOUT_MINUTES} minutes.`);
+    return;
+  }
+
+  await audit("UNLOCK_FAILURE", ctx, { remainingAttempts: result.remainingAttempts });
+  await alertOwner(
+    `Failed unlock attempt from owner account. chat_id=${ctx.chat.id} time=${new Date().toISOString()}`,
+    "unlock-failure"
+  );
+  await ctx.reply(`Unlock failed. ${result.remainingAttempts} attempt${result.remainingAttempts === 1 ? "" : "s"} left before temporary lockout.`);
 });
 
 bot.command("lock", async (ctx) => {
-  await lockNow();
+  await unlockManager.lockNow();
   await audit("LOCK", ctx, {});
   await ctx.reply("Locked.");
 });
 
 const protectedRoute = bot.filter(async (ctx) => {
-  if (isLocked()) {
+  if (unlockManager.isLocked()) {
     await audit("DENIED_LOCKED", ctx, { command: ctx.message?.text });
     await ctx.reply("Locked. Use /unlock first.");
     return false;
@@ -373,9 +312,7 @@ protectedRoute.on("message:text", async (ctx) => {
     await ctx.reply("Request failed. See logs.");
   } finally {
     clearInterval(typingTimer);
-    if (Date.now() >= unlockState.unlockedUntil) {
-      await lockNow();
-    }
+    await unlockManager.relockIfExpired();
   }
 });
 
@@ -399,7 +336,7 @@ process.on("SIGUSR1", () => {
       time: new Date().toISOString(),
       event: "LOCAL_UNLOCK_ERROR",
       error: error?.message || String(error),
-    }).catch(() => { });
+    });
   });
 });
 
@@ -419,7 +356,7 @@ await appendAuditLine({
   ownerChatId: OWNER_CHAT_ID,
   unlockMethod: UNLOCK_METHOD,
   privateOnly: ALLOW_PRIVATE_CHATS_ONLY,
-  unlockedUntil: unlockState.unlockedUntil || null,
+  unlockedUntil: unlockManager.unlockedUntil || null,
 });
 await startBotWithRetry();
 
@@ -427,22 +364,20 @@ async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log("Shutting down Telegram pi bridge...");
-  bot.stop();
+  await bot.stop().catch(() => {});
   await appendAuditLine({ time: new Date().toISOString(), event: "SHUTDOWN" });
   await sessionPool.disposeAll();
   process.exit(0);
 }
 
 async function unlockFromLocalTui() {
-  unlockState.unlockedUntil = Date.now() + UNLOCK_TTL_MINUTES * 60_000;
-  unlockState.unlockedBy = "tui-local";
-  await saveUnlockState();
-  console.log(`Local TUI unlock granted until ${new Date(unlockState.unlockedUntil).toISOString()}`);
+  const unlockedUntil = await unlockManager.unlockWithoutCode("tui-local");
+  console.log(`Local TUI unlock granted until ${new Date(unlockedUntil).toISOString()}`);
   await appendAuditLine({
     time: new Date().toISOString(),
     event: "LOCAL_UNLOCK",
-    unlockedUntil: new Date(unlockState.unlockedUntil).toISOString(),
-    unlockedBy: unlockState.unlockedBy,
+    unlockedUntil: new Date(unlockedUntil).toISOString(),
+    unlockedBy: unlockManager.unlockedBy,
   });
 }
 
@@ -530,10 +465,6 @@ async function audit(event, ctx, extra = {}) {
   });
 }
 
-async function appendAuditLine(entry) {
-  await appendFile(AUDIT_LOG_FILE, `${JSON.stringify(entry)}\n`, "utf8");
-}
-
 async function alertOwner(text, fingerprint = "default") {
   const now = Date.now();
   const last = recentAlerts.get(fingerprint) || 0;
@@ -560,120 +491,6 @@ async function alertOwner(text, fingerprint = "default") {
   }
 }
 
-function isLocked() {
-  return Date.now() >= unlockState.unlockedUntil;
-}
-
-async function lockNow() {
-  if (unlockState.unlockedUntil === 0) return;
-  unlockState.unlockedUntil = 0;
-  unlockState.unlockedBy = null;
-  await saveUnlockState();
-}
-
-async function loadUnlockState() {
-  try {
-    const raw = await readFile(UNLOCK_STATE_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    unlockState.unlockedUntil = Number(parsed?.unlockedUntil) || 0;
-    unlockState.unlockedBy = parsed?.unlockedBy ?? null;
-  } catch (error) {
-    if (error?.code !== "ENOENT") {
-      console.error("Failed to load unlock state:", error);
-    }
-    unlockState.unlockedUntil = 0;
-    unlockState.unlockedBy = null;
-  }
-
-  if (Date.now() >= unlockState.unlockedUntil) {
-    unlockState.unlockedUntil = 0;
-    unlockState.unlockedBy = null;
-    await saveUnlockState();
-  }
-}
-
-async function saveUnlockState() {
-  const payload = JSON.stringify(
-    {
-      unlockedUntil: unlockState.unlockedUntil,
-      unlockedBy: unlockState.unlockedBy,
-      savedAt: new Date().toISOString(),
-    },
-    null,
-    2
-  );
-  const tempFile = `${UNLOCK_STATE_FILE}.tmp`;
-  await writeFile(tempFile, `${payload}\n`, "utf8");
-  await rename(tempFile, UNLOCK_STATE_FILE);
-}
-
-function verifyUnlockCode(code) {
-  const normalized = String(code || "").trim();
-  if (!normalized) return false;
-
-  if (UNLOCK_METHOD === "secret") {
-    return safeEqual(normalized, SHARED_SECRET);
-  }
-
-  return verifyTotp(normalized, TOTP_SECRET);
-}
-
-function verifyTotp(code, secret) {
-  if (!/^\d{6}$/.test(code)) return false;
-  const key = decodeBase32(secret);
-  const step = 30;
-  const nowCounter = Math.floor(Date.now() / 1000 / step);
-  for (const offset of [-1, 0, 1]) {
-    if (generateTotp(key, nowCounter + offset) === code) return true;
-  }
-  return false;
-}
-
-function generateTotp(key, counter) {
-  const buffer = Buffer.alloc(8);
-  buffer.writeBigUInt64BE(BigInt(counter));
-  const hmac = crypto.createHmac("sha1", key).update(buffer).digest();
-  const offset = hmac[hmac.length - 1] & 0x0f;
-  const binary =
-    ((hmac[offset] & 0x7f) << 24) |
-    ((hmac[offset + 1] & 0xff) << 16) |
-    ((hmac[offset + 2] & 0xff) << 8) |
-    (hmac[offset + 3] & 0xff);
-  return String(binary % 1_000_000).padStart(6, "0");
-}
-
-function decodeBase32(input) {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-  const clean = String(input || "")
-    .toUpperCase()
-    .replace(/=+$/g, "")
-    .replace(/\s+/g, "");
-  if (!clean) throw new Error("UNLOCK_TOTP_SECRET is empty");
-
-  const out = Buffer.alloc(Math.floor((clean.length * 5) / 8));
-  let bits = 0;
-  let value = 0;
-  let index = 0;
-  for (const char of clean) {
-    const v = alphabet.indexOf(char);
-    if (v === -1) throw new Error("UNLOCK_TOTP_SECRET must be base32 encoded");
-    value = (value << 5) | v;
-    bits += 5;
-    if (bits >= 8) {
-      bits -= 8;
-      out[index++] = (value >>> bits) & 0xff;
-    }
-  }
-  return out.subarray(0, index);
-}
-
-function safeEqual(a, b) {
-  // Hash both inputs to fixed-length digests to avoid leaking length info
-  const left = crypto.createHash("sha256").update(String(a)).digest();
-  const right = crypto.createHash("sha256").update(String(b)).digest();
-  return crypto.timingSafeEqual(left, right);
-}
-
 function requiredEnv(name) {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`${name} is required`);
@@ -694,9 +511,16 @@ function optionalNumericEnv(name) {
   return value;
 }
 
-// expandHome is imported from ./paths.mjs
+function lockStateText() {
+  return unlockManager.isLocked()
+    ? "locked"
+    : `unlocked until ${new Date(unlockManager.unlockedUntil).toISOString()}`;
+}
 
-
+function formatMinutes(ms) {
+  const minutes = Math.max(1, Math.ceil(ms / 60_000));
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
 
 function helpText() {
   return [
@@ -726,7 +550,7 @@ function formatSessionInfo(session, stats, chatId) {
     `Messages: ${stats.totalMessages} total (${stats.userMessages} user, ${stats.assistantMessages} assistant, ${stats.toolCalls} tool calls)`,
     `Tokens: ${stats.tokens.total} total (${stats.tokens.input} in, ${stats.tokens.output} out, ${stats.tokens.cacheRead} cache read, ${stats.tokens.cacheWrite} cache write)`,
     `Cost: ${formatCost(stats.cost)}`,
-    `State: ${isLocked() ? "locked" : `unlocked until ${new Date(unlockState.unlockedUntil).toISOString()}`}`,
+    `State: ${lockStateText()}`,
   ].join("\n");
 }
 
@@ -738,7 +562,7 @@ function formatResumeList(sessions) {
     );
   });
   if (sessions.length > 12) {
-    lines.push(`…and ${sessions.length - 12} more. Use a smaller habit, or I can add pagination later.`);
+    lines.push(`…and ${sessions.length - 12} more (only the 12 most recent are listed).`);
   }
   lines.push("", "Use /resume <number> or /resume <name> to reopen one.");
   return lines.join("\n");
@@ -747,27 +571,6 @@ function formatResumeList(sessions) {
 function formatCost(value) {
   const number = Number(value || 0);
   return `$${number.toFixed(4)}`;
-}
-
-function commandArgs(text) {
-  const raw = String(text || "").trim();
-  const firstSpace = raw.indexOf(" ");
-  return firstSpace === -1 ? "" : raw.slice(firstSpace + 1).trim();
-}
-
-function splitForTelegram(text) {
-  if (text.length <= TELEGRAM_MAX_MESSAGE) return [text];
-  const chunks = [];
-  let remaining = text;
-  while (remaining.length > TELEGRAM_MAX_MESSAGE) {
-    let splitAt = remaining.lastIndexOf("\n", TELEGRAM_MAX_MESSAGE);
-    if (splitAt < 1000) splitAt = remaining.lastIndexOf(" ", TELEGRAM_MAX_MESSAGE);
-    if (splitAt < 1000) splitAt = TELEGRAM_MAX_MESSAGE;
-    chunks.push(remaining.slice(0, splitAt).trim());
-    remaining = remaining.slice(splitAt).trim();
-  }
-  if (remaining) chunks.push(remaining);
-  return chunks;
 }
 
 async function withChatLock(chatId, task) {
@@ -808,18 +611,12 @@ function contextMeta(ctx) {
     username: ctx.from?.username ?? null,
     chatId: ctx.chat?.id ?? null,
     chatType: ctx.chat?.type ?? null,
-    textPreview: safePreview(ctx.message?.text || ""),
+    textPreview: redactedPreview(ctx.message?.text || ""),
   };
 }
 
-function safePreview(text) {
-  const normalized = String(text || "").replace(/\s+/g, " ").trim();
-  return normalized.length > 200 ? `${normalized.slice(0, 200)}…` : normalized;
+// Never write unlock codes or shared secrets to the audit log.
+function redactedPreview(text) {
+  if (/^\/unlock(\s|@|$)/i.test(String(text).trim())) return "/unlock <redacted>";
+  return safePreview(text);
 }
-
-function parseBoolean(value, fallback) {
-  if (value == null || value === "") return fallback;
-  return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
-}
-
-// sleep is imported from ./paths.mjs

@@ -22,7 +22,8 @@
   },
   "scripts": {
     "start": "node src/index.mjs",
-    "check": "node --check src/index.mjs && node --check src/manage.mjs && node --check src/tui.mjs && node --check src/manager-lib.mjs && node --check src/paths.mjs",
+    "check": "node --check src/index.mjs && node --check src/manage.mjs && node --check src/tui.mjs && node --check src/manager-lib.mjs && node --check src/paths.mjs && node --check src/totp.mjs && node --check src/unlock.mjs && node --check src/audit.mjs && node --check src/telegram-format.mjs && node --check src/session-pool.mjs",
+    "test": "node --test test/*.test.mjs",
     "bridge:start": "node src/manage.mjs start",
     "bridge:stop": "node src/manage.mjs stop",
     "bridge:restart": "node src/manage.mjs restart",

@@ -6,5 +6,4 @@ data/
 run/
 share/
 *.pid
-systemd/telegram-pi-bridge.service
 systemd/telepi.service

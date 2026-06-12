@@ -1,4 +1,4 @@
-import { mkdir, open, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, readlink, rm, stat, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFile, spawn } from "node:child_process";
@@ -20,7 +20,6 @@ export const SYSTEMD_LOCAL_FILE = path.join(SYSTEMD_DIR, "telepi.service");
 export const SYSTEMD_TEMPLATE_FILE = path.join(PACKAGE_DIR, "systemd", "telepi.service.example");
 export const PI_AUTH_FILE = path.join(os.homedir(), ".pi", "agent", "auth.json");
 export const SYSTEMD_UNIT = "telepi.service";
-const ENTRYPOINT_BASENAME = path.basename(ENTRYPOINT);
 const execFileAsync = promisify(execFile);
 
 export async function ensureRuntimeDirs() {
@@ -61,8 +60,7 @@ export async function getStatus() {
   if (managedBridgePid && isPidRunning(managedBridgePid)) {
     pid = managedBridgePid;
     running = true;
-    await ensureRuntimeDirs();
-    await writeFile(PID_FILE, `${pid}\n`, "utf8");
+    await writePidFileIfChanged(pid);
   } else {
     pid = await getPid();
     running = pid != null && isPidRunning(pid);
@@ -72,8 +70,7 @@ export async function getStatus() {
       if (discoveredPid) {
         pid = discoveredPid;
         running = true;
-        await ensureRuntimeDirs();
-        await writeFile(PID_FILE, `${pid}\n`, "utf8");
+        await writePidFileIfChanged(pid);
       }
     }
   }
@@ -313,6 +310,14 @@ export async function readEnvFile() {
   return parseEnv(raw);
 }
 
+async function writePidFileIfChanged(pid) {
+  const next = `${pid}\n`;
+  const current = await readFile(PID_FILE, "utf8").catch(() => null);
+  if (current === next) return;
+  await ensureRuntimeDirs();
+  await writeFile(PID_FILE, next, "utf8");
+}
+
 const CONFIG_DEFAULTS = {
   TELEGRAM_BOT_TOKEN: "",
   OWNER_TELEGRAM_USER_ID: "",
@@ -377,7 +382,9 @@ export async function writeEnvConfig(config) {
     ""
   );
 
-  await writeFile(ENV_FILE, `${lines.join("\n")}\n`, "utf8");
+  // The env file holds the bot token and unlock secret; keep it owner-only.
+  await writeFile(ENV_FILE, `${lines.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+  await chmod(ENV_FILE, 0o600);
 }
 
 export async function writeSystemdService({ installPath, user }) {
@@ -409,7 +416,42 @@ export async function triggerLocalUnlock() {
 export function renderSystemdService({ workingDirectory, user }) {
   const safeDir = workingDirectory || "/opt/telepi";
   const safeUser = user || "youruser";
-  return `[Unit]\nDescription=telepi\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=${safeUser}\nWorkingDirectory=${safeDir}\nEnvironmentFile=${safeDir}/.env\nExecStart=/usr/bin/env telepi\nRestart=always\nRestartSec=5\nNoNewPrivileges=true\nPrivateTmp=true\nProtectControlGroups=true\nProtectKernelTunables=true\nProtectKernelModules=true\nLockPersonality=true\nRestrictSUIDSGID=true\nUMask=0077\n\n[Install]\nWantedBy=multi-user.target\n`;
+  return [
+    "[Unit]",
+    "Description=telepi",
+    "After=network-online.target",
+    "Wants=network-online.target",
+    "",
+    "[Service]",
+    "Type=simple",
+    `User=${safeUser}`,
+    `WorkingDirectory=${safeDir}`,
+    `EnvironmentFile=${safeDir}/.env`,
+    "ExecStart=/usr/bin/env telepi",
+    "Restart=always",
+    "RestartSec=5",
+    "NoNewPrivileges=true",
+    "PrivateTmp=true",
+    "ProtectSystem=full",
+    "ProtectControlGroups=true",
+    "ProtectKernelTunables=true",
+    "ProtectKernelModules=true",
+    "ProtectClock=true",
+    "ProtectHostname=true",
+    "LockPersonality=true",
+    "RestrictSUIDSGID=true",
+    "RestrictRealtime=true",
+    "RestrictNamespaces=true",
+    "CapabilityBoundingSet=",
+    "SystemCallArchitectures=native",
+    // AF_NETLINK is needed by getaddrinfo's interface enumeration.
+    "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+    "UMask=0077",
+    "",
+    "[Install]",
+    "WantedBy=multi-user.target",
+    "",
+  ].join("\n");
 }
 
 export async function testConfiguration() {
@@ -428,7 +470,7 @@ export async function testConfiguration() {
   ];
 }
 
-function parseEnv(raw) {
+export function parseEnv(raw) {
   const result = {};
   for (const line of String(raw).split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -541,18 +583,7 @@ async function listBridgeProcesses() {
       const ppid = Number(ppidText);
       if (!Number.isFinite(pid) || pid === process.pid || !isPidRunning(pid)) continue;
 
-      let kind = null;
-      if (args.includes("sh -c node src/index.mjs") || args.includes(`sh -c node ${ENTRYPOINT}`)) {
-        kind = "bridge-shell";
-      } else if (
-        args.includes(ENTRYPOINT) ||
-        args.includes("node src/index.mjs") ||
-        args.includes(`node ${ENTRYPOINT_BASENAME}`) ||
-        args.endsWith(`/${ENTRYPOINT_BASENAME}`)
-      ) {
-        kind = "bridge-node";
-      }
-
+      const kind = await classifyBridgeProcess(pid, args);
       if (!kind) continue;
       processes.push({ pid, ppid, args, kind });
     }
@@ -560,6 +591,20 @@ async function listBridgeProcesses() {
   } catch {
     return [];
   }
+}
+
+// Only claim a process as ours when its args reference this package's
+// entrypoint, or a relative "src/index.mjs" launched from our directory —
+// otherwise stop/restart could kill an unrelated project's index.mjs.
+async function classifyBridgeProcess(pid, args) {
+  const explicit = args.includes(ENTRYPOINT);
+  const relative = /(^|\s)(node|sh -c node)\s+(\.\/)?src\/index\.mjs(\s|$)/.test(args);
+  if (!explicit && !relative) return null;
+  if (!explicit) {
+    const cwd = await readlink(`/proc/${pid}/cwd`).catch(() => null);
+    if (cwd !== BASE_DIR && cwd !== PACKAGE_DIR) return null;
+  }
+  return args.includes("sh -c ") ? "bridge-shell" : "bridge-node";
 }
 
 async function killStrayBridgeProcesses() {
@@ -619,5 +664,3 @@ async function waitForExit(pid, timeoutMs) {
   }
   return !isPidRunning(pid);
 }
-
-// sleep is imported from ./paths.mjs
