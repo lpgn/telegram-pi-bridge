@@ -33,8 +33,8 @@
     "tui": "node src/tui.mjs"
   },
   "dependencies": {
-    "@mariozechner/pi-ai": "^0.56.3",
-    "@mariozechner/pi-coding-agent": "^0.56.3",
+    "@mariozechner/pi-ai": "^0.73.1",
+    "@mariozechner/pi-coding-agent": "^0.73.1",
     "blessed": "^0.1.81",
     "dotenv": "^16.4.7",
     "grammy": "^1.35.0",

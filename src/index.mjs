@@ -38,8 +38,10 @@ if (!["totp", "secret"].includes(UNLOCK_METHOD)) {
   throw new Error("UNLOCK_METHOD must be 'totp' or 'secret'");
 }
 
-const authStorage = AuthStorage.create();
-const modelRegistry = new ModelRegistry(authStorage);
+// ModelRegistry.create() (not the constructor) loads custom providers/models
+// from models.json; wire both stores to the configured pi agent dir.
+const authStorage = AuthStorage.create(path.join(PI_AGENT_DIR, "auth.json"));
+const modelRegistry = ModelRegistry.create(authStorage, path.join(PI_AGENT_DIR, "models.json"));
 const fixedModel = resolveModelFromEnv();
 
 const sessionPool = new PiSessionPool({
@@ -288,10 +290,18 @@ protectedRoute.on("message:text", async (ctx) => {
     await ctx.api.sendChatAction(ctx.chat.id, "typing");
     const session = await sessionPool.get(ctx.chat.id);
     let replyText = "";
+    let agentError = null;
 
     const unsubscribe = session.subscribe((event) => {
       if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
         replyText += event.assistantMessageEvent.delta;
+      } else if (event.type === "message_end") {
+        // Model/provider failures end the turn without text; capture them so
+        // the user sees the cause instead of "(No text response produced.)".
+        const message = event.message;
+        if (message?.role === "assistant" && (message.errorMessage || message.stopReason === "error")) {
+          agentError = message.errorMessage || "Model call failed without details.";
+        }
       }
     });
 
@@ -301,11 +311,19 @@ protectedRoute.on("message:text", async (ctx) => {
       unsubscribe();
     }
 
-    replyText = replyText.trim() || "(No text response produced.)";
+    replyText = replyText.trim();
+    if (!replyText) {
+      replyText = agentError ? `pi error: ${safePreview(agentError)}` : "(No text response produced.)";
+    } else if (agentError) {
+      replyText += `\n\n[pi error: ${safePreview(agentError)}]`;
+    }
     for (const chunk of splitForTelegram(replyText)) {
       await ctx.reply(chunk);
     }
-    await audit("PROMPT_END", ctx, { responseLength: replyText.length });
+    await audit("PROMPT_END", ctx, {
+      responseLength: replyText.length,
+      ...(agentError ? { agentError: safePreview(agentError) } : {}),
+    });
   } catch (error) {
     console.error(`Chat ${ctx.chat.id} failed:`, error);
     await audit("PROMPT_ERROR", ctx, { error: error?.message || String(error) });
@@ -598,7 +616,9 @@ function resolveModelFromEnv() {
   const provider = process.env.PI_MODEL_PROVIDER?.trim();
   const modelName = process.env.PI_MODEL_NAME?.trim();
   if (!provider || !modelName) return undefined;
-  const model = getModel(provider, modelName);
+  // The registry also knows custom models from ~/.pi/agent/models.json;
+  // getModel() only covers built-ins.
+  const model = modelRegistry.find(provider, modelName) ?? getModel(provider, modelName);
   if (!model) {
     throw new Error(`Unknown model: ${provider}/${modelName}`);
   }
