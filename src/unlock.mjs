@@ -86,7 +86,12 @@ export class UnlockManager {
       if (this.method === "secret") {
         ok = safeEqual(normalized, this.sharedSecret);
       } else {
-        matchedCounter = verifyTotp(normalized, this.totpSecret, { lastCounter: this.state.lastTotpCounter });
+        matchedCounter = verifyTotp(normalized, this.totpSecret, {
+          // ±3 steps (90s): tolerates phone-clock drift plus Telegram delivery lag;
+          // replay protection via lastCounter keeps accepted codes single-use.
+          window: 3,
+          lastCounter: this.state.lastTotpCounter,
+        });
         ok = matchedCounter != null;
       }
     }
